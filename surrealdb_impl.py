@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from surrealdb import Surreal
+from surrealdb import AsyncSurreal
 
 from lightrag.base import (
     BaseGraphStorage,
@@ -39,6 +39,10 @@ class SurrealDBDB:
     """
     Manages a single async SurrealDB connection shared across all four
     storage classes in one LightRAG workspace.
+
+    SDK note: AsyncSurreal() is a factory function (not a class) that returns
+    an AsyncWsSurrealConnection. query() returns results already unwrapped —
+    no 'result' key to dig into.
     """
 
     def __init__(self) -> None:
@@ -47,14 +51,14 @@ class SurrealDBDB:
         self.database  = os.getenv("SURREALDB_DATABASE",  "assistant")
         self.username  = os.getenv("SURREALDB_USERNAME",  "root")
         self.password  = os.getenv("SURREALDB_PASSWORD",  "root")
-        self._client: Surreal | None = None
+        self._client = None
         self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
         async with self._lock:
             if self._client is not None:
                 return
-            client = Surreal(self.url)
+            client = AsyncSurreal(self.url)   # factory fn returns connection object
             await client.connect()
             await client.signin({"user": self.username, "pass": self.password})
             await client.use(self.namespace, self.database)
@@ -64,14 +68,15 @@ class SurrealDBDB:
     async def query(self, sql: str, vars: dict[str, Any] | None = None) -> list[Any]:
         if self._client is None:
             raise RuntimeError("Call connect() first")
+        # SDK returns the result directly (already unwrapped from the envelope)
         result = await self._client.query(sql, vars or {})
-        # SDK v2 returns a list of statement results; unwrap the first one
-        if isinstance(result, list) and result:
-            first = result[0]
-            if isinstance(first, dict) and "result" in first:
-                return first["result"] or []
-            if isinstance(first, list):
-                return first
+        # Normalise to list — some statements return a single dict, others a list
+        if result is None:
+            return []
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return [result]
         return []
 
     async def close(self) -> None:
