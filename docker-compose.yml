@@ -1,0 +1,120 @@
+services:
+
+  # ── SurrealDB ──────────────────────────────────────────────────────────────
+  surrealdb:
+    image: surrealdb/surrealdb:v2.1.4
+    container_name: graphrag_surrealdb
+    restart: unless-stopped
+    command: start --log info --user root --pass root file:/data/graphrag.db
+    volumes:
+      - surrealdb_data:/data
+    ports:
+      - "8001:8000"        # host:container — avoids clash with the API on 8000
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Ollama ────────────────────────────────────────────────────────────────
+  # Ollama runs on the HOST and is accessed via host.docker.internal.
+  # This avoids GPU passthrough complexity in Docker on Windows/Linux.
+  # If you want Ollama inside Docker, see the commented block below.
+
+  # ── GraphRAG API ──────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: graphrag_api
+    restart: unless-stopped
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    environment:
+      # Override the SurrealDB URL to use the service name, not localhost
+      SURREALDB_URL: ws://surrealdb:8000/rpc
+      # Point Ollama at the host machine
+      OLLAMA_HOST: http://host.docker.internal:11434
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount library and working dir from host so data persists
+      - ${LIBRARY_PATH:-./library}:/library:ro
+      - lightrag_data:/app/lightrag_data
+      # Hot-reload: mount source files so changes reflect without rebuild
+      - ./api.py:/app/api.py
+      - ./ingest.py:/app/ingest.py
+      - ./surrealdb_impl.py:/app/surrealdb_impl.py
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+
+  # ── Ingestion worker ──────────────────────────────────────────────────────
+  # Run once to index your library. Not a long-running service.
+  # Usage: docker compose run --rm ingest
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: graphrag_ingest
+    command: python ingest.py --config /app/config.yaml
+    env_file: .env
+    environment:
+      SURREALDB_URL: ws://surrealdb:8000/rpc
+      OLLAMA_HOST: http://host.docker.internal:11434
+      LIBRARY_PATH: /library
+    volumes:
+      - ${LIBRARY_PATH:-./library}:/library:ro
+      - lightrag_data:/app/lightrag_data
+      - ./config.yaml:/app/config.yaml:ro
+      - ./ingest.py:/app/ingest.py
+      - ./surrealdb_impl.py:/app/surrealdb_impl.py
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+    profiles:
+      - ingest     # only starts with: docker compose --profile ingest up
+
+  # ── OpenWebUI ─────────────────────────────────────────────────────────────
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: graphrag_openwebui
+    restart: unless-stopped
+    environment:
+      # Point OpenWebUI at our FastAPI bridge instead of real Ollama
+      OLLAMA_BASE_URL: http://api:8000
+    ports:
+      - "3000:8080"
+    volumes:
+      - openwebui_data:/app/backend/data
+    depends_on:
+      - api
+
+volumes:
+  surrealdb_data:
+  lightrag_data:
+  openwebui_data:
+
+
+# ── Ollama-in-Docker (optional, GPU passthrough) ──────────────────────────
+# Uncomment this block and remove the OLLAMA_HOST env vars above if you
+# prefer Ollama containerized. Requires the NVIDIA Container Toolkit.
+#
+#  ollama:
+#    image: ollama/ollama:latest
+#    container_name: graphrag_ollama
+#    restart: unless-stopped
+#    ports:
+#      - "11434:11434"
+#    volumes:
+#      - ollama_data:/root/.ollama
+#    deploy:
+#      resources:
+#        reservations:
+#          devices:
+#            - driver: nvidia
+#              count: 1
+#              capabilities: [gpu]
+#
+# Add to volumes section:
+#   ollama_data:

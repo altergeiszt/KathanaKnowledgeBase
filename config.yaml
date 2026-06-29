@@ -1,0 +1,31 @@
+# GraphRAG Assistant — ingestion pipeline config
+# Mounted into the ingest container at /app/config.yaml
+# All values here can be overridden by environment variables in .env
+
+library_path: /library           # path inside the container (do not change)
+working_dir:  /app/lightrag_data  # path inside the container (do not change)
+
+embedding_model: all-MiniLM-L6-v2
+ollama_model:    qwen2.5:14b
+vector_dim:      384
+
+max_concurrent_inserts: 4
+chunk_max_chars:        1500
+
+dedup_threshold: 0.85
+dedup_num_perm:  128
+dedup_shingle_k: 5
+
+# Map directory name fragments to content type.
+# The pipeline classifies each file by checking if any of these
+# keywords appear in its path components (case-insensitive).
+# First match wins; falls back to 'selfhelp' (full prose, no special handling).
+content_type_rules:
+  software: software
+  dev:      software
+  code:     software
+  math:     math
+  maths:    math
+  self:     selfhelp
+  help:     selfhelp
+  personal: selfhelp
