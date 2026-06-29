@@ -1,42 +1,56 @@
 """
 patch_lightrag.py
 
-Registers the SurrealDB storage adapter in LightRAG's storage factory.
+Registers the SurrealDB storage adapter in LightRAG 1.5.4's storage factory.
 Run once after `pip install lightrag-hku`, or bake into the Docker build.
-
 Safe to re-run — checks for existing entries before writing.
+
+What this does:
+  1. Copies surrealdb_impl.py into lightrag/kg/ so it's importable
+  2. Adds four entries to the STORAGES dict in lightrag/kg/__init__.py
+  3. Adds four entries to STORAGE_IMPLEMENTATIONS (validation registry)
+  4. Adds four entries to STORAGE_ENV_REQUIREMENTS (env-var check registry)
 """
+
+from __future__ import annotations
 
 import importlib.util
 import sys
 from pathlib import Path
 
-
-REGISTRATIONS = {
-    "SurrealDBKVStorage":        "lightrag.kg.surrealdb_impl.SurrealDBKVStorage",
-    "SurrealDBVectorStorage":    "lightrag.kg.surrealdb_impl.SurrealDBVectorStorage",
-    "SurrealDBGraphStorage":     "lightrag.kg.surrealdb_impl.SurrealDBGraphStorage",
-    "SurrealDBDocStatusStorage": "lightrag.kg.surrealdb_impl.SurrealDBDocStatusStorage",
+# Class name -> relative module path (matches STORAGES dict convention)
+STORAGES_ENTRIES = {
+    "SurrealDBKVStorage":        ".kg.surrealdb_impl",
+    "SurrealDBVectorStorage":    ".kg.surrealdb_impl",
+    "SurrealDBGraphStorage":     ".kg.surrealdb_impl",
+    "SurrealDBDocStatusStorage": ".kg.surrealdb_impl",
 }
+
+# Entries to add to each STORAGE_IMPLEMENTATIONS bucket
+IMPL_ENTRIES = {
+    "KV_STORAGE":        "SurrealDBKVStorage",
+    "VECTOR_STORAGE":    "SurrealDBVectorStorage",
+    "GRAPH_STORAGE":     "SurrealDBGraphStorage",
+    "DOC_STATUS_STORAGE":"SurrealDBDocStatusStorage",
+}
+
+# No special env vars required (connection params read from .env via python-dotenv)
+ENV_REQUIREMENTS = {name: [] for name in STORAGES_ENTRIES}
 
 
 def find_lightrag_kg_init() -> Path:
-    """Locate lightrag/kg/__init__.py in the active Python environment."""
     spec = importlib.util.find_spec("lightrag")
     if spec is None or spec.origin is None:
         print("ERROR: lightrag is not installed. Run: pip install lightrag-hku")
         sys.exit(1)
-    lightrag_root = Path(spec.origin).parent
-    kg_init = lightrag_root / "kg" / "__init__.py"
+    kg_init = Path(spec.origin).parent / "kg" / "__init__.py"
     if not kg_init.exists():
         print(f"ERROR: Could not find {kg_init}")
-        print("Your version of lightrag-hku may have a different structure.")
         sys.exit(1)
     return kg_init
 
 
 def find_surrealdb_impl_src() -> Path:
-    """Find surrealdb_impl.py relative to this script."""
     here = Path(__file__).parent
     impl = here / "surrealdb_impl.py"
     if not impl.exists():
@@ -45,63 +59,113 @@ def find_surrealdb_impl_src() -> Path:
     return impl
 
 
-def copy_impl_to_lightrag(kg_init: Path, impl_src: Path) -> None:
-    """Copy surrealdb_impl.py into lightrag/kg/ so it's importable."""
+def copy_impl(kg_init: Path, impl_src: Path) -> None:
     dest = kg_init.parent / "surrealdb_impl.py"
     dest.write_text(impl_src.read_text())
     print(f"  Copied surrealdb_impl.py → {dest}")
 
 
-def patch_init(kg_init: Path) -> None:
-    """
-    Insert STORAGE_IMPLEMENTATIONS entries into lightrag/kg/__init__.py.
-    Finds the STORAGE_IMPLEMENTATIONS dict and appends missing entries
-    directly after the last existing entry in that block.
-    """
-    original = kg_init.read_text()
-    lines = original.splitlines()
-
-    # Find lines already registering something so we know the dict name
-    insert_after = -1
-    for i, line in enumerate(lines):
-        if "STORAGE_IMPLEMENTATIONS" in line and "=" in line:
-            insert_after = i
-
-    if insert_after == -1:
-        # Dict not found — append at end of file as a fallback
-        print("  WARNING: STORAGE_IMPLEMENTATIONS dict not found in __init__.py")
-        print("  Appending registrations at end of file.")
-        new_lines = lines + ["", "# SurrealDB adapter registrations (added by patch_lightrag.py)"]
-        insert_after = len(new_lines) - 1
-    else:
-        new_lines = lines[:]
-
-    already_registered = {k for k, v in REGISTRATIONS.items() if any(k in l for l in lines)}
-    to_add = {k: v for k, v in REGISTRATIONS.items() if k not in already_registered}
-
+def patch_storages_dict(content: str) -> str:
+    """Add entries to the STORAGES = { ... } dict."""
+    already = [name for name in STORAGES_ENTRIES if f'"{name}"' in content]
+    to_add = {k: v for k, v in STORAGES_ENTRIES.items() if k not in already}
     if not to_add:
-        print("  All SurrealDB entries already present — nothing to patch.")
-        return
+        print("  STORAGES dict: all entries already present.")
+        return content
 
-    injection = []
-    for key, value in to_add.items():
-        injection.append(f'STORAGE_IMPLEMENTATIONS["{key}"] = "{value}"')
+    # Find the closing brace of STORAGES = { ... }
+    start = content.find("STORAGES = {")
+    if start == -1:
+        print("  WARNING: STORAGES dict not found — appending at end of file.")
+        lines = [f'    "{k}": "{v}",' for k, v in to_add.items()]
+        return content + "\n# SurrealDB (added by patch_lightrag.py)\n" + "\n".join(lines) + "\n"
 
-    # Insert after the last found STORAGE_IMPLEMENTATIONS line
-    patched = new_lines[:insert_after + 1] + injection + new_lines[insert_after + 1:]
-    kg_init.write_text("\n".join(patched) + "\n")
-    print(f"  Patched {kg_init}")
-    for line in injection:
-        print(f"    + {line}")
+    # Find the matching closing brace
+    depth, i = 0, start
+    while i < len(content):
+        if content[i] == '{':
+            depth += 1
+        elif content[i] == '}':
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+
+    insert_pos = i  # position of closing }
+    injection = "\n    # SurrealDB adapter (added by patch_lightrag.py)\n"
+    for k, v in to_add.items():
+        injection += f'    "{k}": "{v}",\n'
+        print(f"    + STORAGES[\"{k}\"] = \"{v}\"")
+
+    return content[:insert_pos] + injection + content[insert_pos:]
+
+
+def patch_storage_implementations(content: str) -> str:
+    """Add class names to each bucket's 'implementations' list."""
+    import re
+    patched = content
+    for bucket, class_name in IMPL_ENTRIES.items():
+        if class_name in patched:
+            print(f"  STORAGE_IMPLEMENTATIONS[{bucket}]: {class_name} already present.")
+            continue
+        # Find the implementations list for this bucket
+        pattern = rf'("{bucket}".*?"implementations":\s*\[)(.*?)(\])'
+        def inserter(m, cn=class_name):
+            return m.group(1) + m.group(2) + f'            "{cn}",\n        ' + m.group(3)
+        new, count = re.subn(pattern, inserter, patched, flags=re.DOTALL)
+        if count:
+            patched = new
+            print(f"    + STORAGE_IMPLEMENTATIONS[\"{bucket}\"][\"implementations\"] += [\"{class_name}\"]")
+        else:
+            print(f"  WARNING: could not find bucket {bucket} in STORAGE_IMPLEMENTATIONS")
+    return patched
+
+
+def patch_env_requirements(content: str) -> str:
+    """Add entries to STORAGE_ENV_REQUIREMENTS dict."""
+    to_add = {k: v for k, v in ENV_REQUIREMENTS.items() if f'"{k}"' not in content}
+    if not to_add:
+        print("  STORAGE_ENV_REQUIREMENTS: all entries already present.")
+        return content
+
+    start = content.find("STORAGE_ENV_REQUIREMENTS")
+    if start == -1:
+        print("  WARNING: STORAGE_ENV_REQUIREMENTS not found — skipping.")
+        return content
+
+    # Find its closing brace
+    depth, i = 0, start
+    while i < len(content):
+        if content[i] == '{':
+            depth += 1
+        elif content[i] == '}':
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+
+    injection = "\n    # SurrealDB adapter (added by patch_lightrag.py)\n"
+    for k in to_add:
+        injection += f'    "{k}": [],\n'
+        print(f"    + STORAGE_ENV_REQUIREMENTS[\"{k}\"] = []")
+
+    return content[:i] + injection + content[i:]
 
 
 def main() -> None:
-    print("=== Patching lightrag-hku to register SurrealDB adapter ===")
+    print("=== Patching lightrag-hku 1.5.4 to register SurrealDB adapter ===")
     kg_init  = find_lightrag_kg_init()
     impl_src = find_surrealdb_impl_src()
     print(f"  LightRAG kg init: {kg_init}")
-    copy_impl_to_lightrag(kg_init, impl_src)
-    patch_init(kg_init)
+
+    copy_impl(kg_init, impl_src)
+
+    content = kg_init.read_text()
+    content = patch_storages_dict(content)
+    content = patch_storage_implementations(content)
+    content = patch_env_requirements(content)
+    kg_init.write_text(content)
+
     print("=== Patch complete ===")
 
 

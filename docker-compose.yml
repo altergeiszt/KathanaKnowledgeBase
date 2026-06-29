@@ -5,16 +5,11 @@ services:
     image: surrealdb/surrealdb:v2.1.4
     container_name: graphrag_surrealdb
     restart: unless-stopped
-    command: start --log info --user root --pass root file:/data/graphrag.db
+    command: start --log info --user root --pass root rocksdb:///data/graphrag.db
     volumes:
-      - surrealdb_data:/data
+      - ./surrealdb_data:/data
     ports:
       - "8001:8000"        # host:container — avoids clash with the API on 8000
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   # ── Ollama ────────────────────────────────────────────────────────────────
   # Ollama runs on the HOST and is accessed via host.docker.internal.
@@ -47,7 +42,7 @@ services:
       - ./surrealdb_impl.py:/app/surrealdb_impl.py
     depends_on:
       surrealdb:
-        condition: service_healthy
+        condition: service_started
 
   # ── Ingestion worker ──────────────────────────────────────────────────────
   # Run once to index your library. Not a long-running service.
@@ -71,7 +66,7 @@ services:
       - ./surrealdb_impl.py:/app/surrealdb_impl.py
     depends_on:
       surrealdb:
-        condition: service_healthy
+        condition: service_started
     profiles:
       - ingest     # only starts with: docker compose --profile ingest up
 
@@ -91,7 +86,6 @@ services:
       - api
 
 volumes:
-  surrealdb_data:
   lightrag_data:
   openwebui_data:
 
