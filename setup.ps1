@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Native setup for GraphRAG Knowledge Base Assistant (no Docker required).
