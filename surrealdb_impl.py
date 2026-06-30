@@ -2,10 +2,17 @@
 lightrag/kg/surrealdb_impl.py
 
 SurrealDB storage adapter for LightRAG 1.5.4.
-Implements BaseKVStorage, BaseVectorStorage, BaseGraphStorage,
-and DocStatusStorage using the SurrealDB Python SDK v2.x (async).
+Uses an EMBEDDED SurrealKV connection — no separate SurrealDB server needed.
+The database file lives at SURREALDB_PATH (default: ./lightrag_data/graphrag.db).
 
-Registered via patch_lightrag.py — do not edit lightrag source directly.
+SDK notes (current surrealdb Python package):
+  - AsyncSurreal(url) is a factory function, not a class.
+    surrealkv:// URLs return AsyncEmbeddedSurrealConnection.
+  - query() returns results already unwrapped (no 'result' envelope).
+  - IDs come back as RecordID objects; extract the record_id string with str(rid.record_id).
+  - IN clauses require RecordID objects, not plain strings; use record::id(id) IN $ids
+    with string values as a workaround.
+  - signin() is not required for embedded connections.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from surrealdb import AsyncSurreal
+from surrealdb.data.types.record_id import RecordID
 
 from lightrag.base import (
     BaseGraphStorage,
@@ -25,58 +33,73 @@ from lightrag.base import (
     DocStatus,
     DocStatusStorage,
     DocProcessingStatus,
-    StorageNameSpace,
 )
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from lightrag.utils import EmbeddingFunc, logger
 
 
 # ---------------------------------------------------------------------------
-# Shared connection — one per LightRAG workspace
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _id_str(value: Any) -> str:
+    """Normalise a RecordID or plain string to just the record ID part."""
+    if isinstance(value, RecordID):
+        return str(value.record_id)
+    return str(value)
+
+
+def _normalise_row(row: dict) -> dict:
+    """Convert RecordID values in a row dict to plain strings."""
+    return {k: (_id_str(v) if isinstance(v, RecordID) else v)
+            for k, v in row.items()}
+
+
+# ---------------------------------------------------------------------------
+# Shared embedded connection — one per process
 # ---------------------------------------------------------------------------
 
 class SurrealDBDB:
     """
-    Manages a single async SurrealDB connection shared across all four
-    storage classes in one LightRAG workspace.
-
-    SDK note: AsyncSurreal() is a factory function (not a class) that returns
-    an AsyncWsSurrealConnection. query() returns results already unwrapped —
-    no 'result' key to dig into.
+    Wraps a single AsyncEmbeddedSurrealConnection shared across all four
+    storage classes. The database file persists across restarts.
     """
 
     def __init__(self) -> None:
-        self.url       = os.getenv("SURREALDB_URL",       "ws://localhost:8000/rpc")
+        # surrealkv:// path — can be overridden via env var
+        db_path = os.getenv("SURREALDB_PATH", "./lightrag_data/graphrag.db")
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        self.url       = f"surrealkv://{db_path}"
         self.namespace = os.getenv("SURREALDB_NAMESPACE", "lightrag")
         self.database  = os.getenv("SURREALDB_DATABASE",  "assistant")
-        self.username  = os.getenv("SURREALDB_USERNAME",  "root")
-        self.password  = os.getenv("SURREALDB_PASSWORD",  "root")
-        self._client = None
-        self._lock = asyncio.Lock()
+        self._client   = None
+        self._lock     = asyncio.Lock()
 
     async def connect(self) -> None:
         async with self._lock:
             if self._client is not None:
                 return
-            client = AsyncSurreal(self.url)   # factory fn returns connection object
+            client = AsyncSurreal(self.url)
             await client.connect()
-            await client.signin({"user": self.username, "pass": self.password})
             await client.use(self.namespace, self.database)
             self._client = client
-            logger.info(f"SurrealDB connected: {self.url} / {self.namespace}.{self.database}")
+            logger.info(f"SurrealDB embedded connected: {self.url}")
 
     async def query(self, sql: str, vars: dict[str, Any] | None = None) -> list[Any]:
         if self._client is None:
             raise RuntimeError("Call connect() first")
-        # SDK returns the result directly (already unwrapped from the envelope)
         result = await self._client.query(sql, vars or {})
-        # Normalise to list — some statements return a single dict, others a list
         if result is None:
             return []
         if isinstance(result, list):
-            return result
+            return [_normalise_row(r) if isinstance(r, dict) else r for r in result]
         if isinstance(result, dict):
-            return [result]
+            return [_normalise_row(result)]
         return []
 
     async def close(self) -> None:
@@ -86,25 +109,18 @@ class SurrealDBDB:
                 self._client = None
 
 
-# One connection per workspace, keyed by (namespace, database)
-_CONNECTIONS: dict[tuple[str, str], SurrealDBDB] = {}
+# Singleton — one connection for the whole process
+_CONNECTION: SurrealDBDB | None = None
 _CONN_LOCK = asyncio.Lock()
 
 
 async def get_connection() -> SurrealDBDB:
-    ns  = os.getenv("SURREALDB_NAMESPACE", "lightrag")
-    db  = os.getenv("SURREALDB_DATABASE",  "assistant")
-    key = (ns, db)
+    global _CONNECTION
     async with _CONN_LOCK:
-        if key not in _CONNECTIONS:
-            conn = SurrealDBDB()
-            await conn.connect()
-            _CONNECTIONS[key] = conn
-        return _CONNECTIONS[key]
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+        if _CONNECTION is None:
+            _CONNECTION = SurrealDBDB()
+            await _CONNECTION.connect()
+    return _CONNECTION
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +129,7 @@ def _now_iso() -> str:
 
 @dataclass
 class SurrealDBKVStorage(BaseKVStorage):
-    """
-    Key-value storage for LightRAG entity summaries, community reports,
-    and LLM response cache.
-    """
+    """Key-value store for LightRAG entity summaries, LLM cache, etc."""
 
     def __post_init__(self) -> None:
         self._table = f"kv_{self.namespace}"
@@ -126,13 +139,12 @@ class SurrealDBKVStorage(BaseKVStorage):
         self._db = await get_connection()
         await self._db.query(f"""
             DEFINE TABLE IF NOT EXISTS {self._table} SCHEMAFULL;
-            DEFINE FIELD IF NOT EXISTS id    ON {self._table} TYPE string;
-            DEFINE FIELD IF NOT EXISTS data  ON {self._table} FLEXIBLE TYPE object;
-            DEFINE INDEX IF NOT EXISTS idx_kv_id ON {self._table} COLUMNS id UNIQUE;
+            DEFINE FIELD IF NOT EXISTS id   ON {self._table} TYPE string;
+            DEFINE FIELD IF NOT EXISTS data ON {self._table} FLEXIBLE TYPE object;
         """)
 
     async def finalize(self) -> None:
-        pass  # connection is shared; closed globally
+        pass
 
     async def index_done_callback(self) -> None:
         pass
@@ -146,30 +158,32 @@ class SurrealDBKVStorage(BaseKVStorage):
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         rows = await self._db.query(
-            f"SELECT data FROM {self._table} WHERE id = $id LIMIT 1", {"id": id}
+            f"SELECT data FROM {self._table} WHERE record::id(id) = $id LIMIT 1",
+            {"id": id},
         )
-        return rows[0]["data"] if rows else None
+        return rows[0].get("data") if rows else None
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
         if not ids:
             return []
         rows = await self._db.query(
-            f"SELECT id, data FROM {self._table} WHERE id IN $ids", {"ids": ids}
+            f"SELECT record::id(id) AS id, data FROM {self._table} WHERE record::id(id) IN $ids",
+            {"ids": ids},
         )
-        row_map = {r["id"]: r["data"] for r in rows}
+        row_map = {r["id"]: r.get("data") for r in rows}
         return [row_map.get(i) for i in ids]
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
         if not keys:
             return set()
         rows = await self._db.query(
-            f"SELECT id FROM {self._table} WHERE id IN $ids", {"ids": list(keys)}
+            f"SELECT record::id(id) AS id FROM {self._table} WHERE record::id(id) IN $ids",
+            {"ids": list(keys)},
         )
         existing = {r["id"] for r in rows}
         return keys - existing
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        # LightRAG passes {id: {fields...}, id2: {fields2...}, ...}
         for record_id, record_data in data.items():
             await self._db.query(
                 f"UPSERT type::thing($t, $id) CONTENT {{id: $id, data: $data}}",
@@ -177,11 +191,11 @@ class SurrealDBKVStorage(BaseKVStorage):
             )
 
     async def delete(self, ids: list[str]) -> None:
-        if not ids:
-            return
-        await self._db.query(
-            f"DELETE {self._table} WHERE id IN $ids", {"ids": ids}
-        )
+        for id_ in ids:
+            await self._db.query(
+                f"DELETE type::thing($t, $id)",
+                {"t": self._table, "id": id_},
+            )
 
     async def is_empty(self) -> bool:
         rows = await self._db.query(f"SELECT count() AS cnt FROM {self._table} GROUP ALL")
@@ -194,9 +208,7 @@ class SurrealDBKVStorage(BaseKVStorage):
 
 @dataclass
 class SurrealDBVectorStorage(BaseVectorStorage):
-    """
-    Vector storage backed by SurrealDB's native HNSW index.
-    """
+    """Vector store backed by SurrealDB's native HNSW index."""
 
     def __post_init__(self) -> None:
         self._validate_embedding_func()
@@ -215,8 +227,7 @@ class SurrealDBVectorStorage(BaseVectorStorage):
             DEFINE FIELD IF NOT EXISTS embedding ON {self._table} TYPE array<float>;
             DEFINE FIELD IF NOT EXISTS metadata  ON {self._table} FLEXIBLE TYPE object;
             DEFINE INDEX IF NOT EXISTS hnsw_idx  ON {self._table}
-                FIELDS embedding
-                HNSW DIMENSION {self._dim} DIST COSINE
+                FIELDS embedding HNSW DIMENSION {self._dim} DIST COSINE
                 EFC {self._ef} M {self._m};
         """)
 
@@ -234,7 +245,6 @@ class SurrealDBVectorStorage(BaseVectorStorage):
             return {"status": "error", "message": str(e)}
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        # LightRAG passes {id: {content, embedding, ...metadata}}
         for record_id, record_data in data.items():
             embedding = record_data.get("embedding", [])
             content   = record_data.get("content", "")
@@ -256,7 +266,7 @@ class SurrealDBVectorStorage(BaseVectorStorage):
         if query_embedding is None:
             query_embedding = (await self.embedding_func([query]))[0]
         rows = await self._db.query(
-            f"SELECT id, content, metadata, "
+            f"SELECT record::id(id) AS id, content, metadata, "
             f"vector::similarity::cosine(embedding, $vec) AS score "
             f"FROM {self._table} "
             f"WHERE embedding <|{top_k},{self._ef}|> $vec "
@@ -269,7 +279,9 @@ class SurrealDBVectorStorage(BaseVectorStorage):
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         rows = await self._db.query(
-            f"SELECT * FROM {self._table} WHERE id = $id LIMIT 1", {"id": id}
+            f"SELECT record::id(id) AS id, content, metadata FROM {self._table} "
+            f"WHERE record::id(id) = $id LIMIT 1",
+            {"id": id},
         )
         return rows[0] if rows else None
 
@@ -277,17 +289,19 @@ class SurrealDBVectorStorage(BaseVectorStorage):
         if not ids:
             return []
         rows = await self._db.query(
-            f"SELECT * FROM {self._table} WHERE id IN $ids", {"ids": ids}
+            f"SELECT record::id(id) AS id, content, metadata FROM {self._table} "
+            f"WHERE record::id(id) IN $ids",
+            {"ids": ids},
         )
         row_map = {r["id"]: r for r in rows}
         return [row_map.get(i) for i in ids]
 
     async def delete(self, ids: list[str]) -> None:
-        if not ids:
-            return
-        await self._db.query(
-            f"DELETE {self._table} WHERE id IN $ids", {"ids": ids}
-        )
+        for id_ in ids:
+            await self._db.query(
+                f"DELETE type::thing($t, $id)",
+                {"t": self._table, "id": id_},
+            )
 
     async def delete_entity(self, entity_name: str) -> None:
         await self._db.query(
@@ -305,7 +319,8 @@ class SurrealDBVectorStorage(BaseVectorStorage):
         if not ids:
             return {}
         rows = await self._db.query(
-            f"SELECT id, embedding FROM {self._table} WHERE id IN $ids",
+            f"SELECT record::id(id) AS id, embedding FROM {self._table} "
+            f"WHERE record::id(id) IN $ids",
             {"ids": ids},
         )
         return {r["id"]: r["embedding"] for r in rows}
@@ -318,14 +333,13 @@ class SurrealDBVectorStorage(BaseVectorStorage):
 @dataclass
 class SurrealDBGraphStorage(BaseGraphStorage):
     """
-    Knowledge graph storage using two flat SurrealDB tables.
-    Edges are stored as a flat relation table (not RELATE) to match
-    LightRAG's string-ID edge addressing pattern.
+    Knowledge graph using two flat tables.
+    Edges keyed by 'src___tgt' string to match LightRAG's addressing pattern.
     """
 
     def __post_init__(self) -> None:
-        self._ent = f"ent_{self.namespace}"   # entity nodes
-        self._rel = f"rel_{self.namespace}"   # relation edges
+        self._ent = f"ent_{self.namespace}"
+        self._rel = f"rel_{self.namespace}"
         self._db: SurrealDBDB | None = None
 
     async def initialize(self) -> None:
@@ -338,7 +352,6 @@ class SurrealDBGraphStorage(BaseGraphStorage):
             DEFINE FIELD IF NOT EXISTS description ON {self._ent} TYPE string;
             DEFINE FIELD IF NOT EXISTS source_id   ON {self._ent} TYPE string;
             DEFINE FIELD IF NOT EXISTS extra       ON {self._ent} FLEXIBLE TYPE object;
-            DEFINE INDEX IF NOT EXISTS idx_ent_name ON {self._ent} COLUMNS entity_name UNIQUE;
 
             DEFINE TABLE IF NOT EXISTS {self._rel} SCHEMAFULL;
             DEFINE FIELD IF NOT EXISTS id          ON {self._rel} TYPE string;
@@ -413,16 +426,13 @@ class SurrealDBGraphStorage(BaseGraphStorage):
 
     async def get_all_labels(self) -> list[str]:
         rows = await self._db.query(f"SELECT entity_name FROM {self._ent}")
-        return sorted(r["entity_name"] for r in rows)
+        return sorted(r["entity_name"] for r in rows if "entity_name" in r)
 
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
         rows = await self._db.query(
-            f"SELECT entity_name, count() AS deg FROM {self._rel} "
-            f"GROUP BY src_id, tgt_id LIMIT {limit}"
+            f"SELECT entity_name FROM {self._ent} LIMIT {limit}"
         )
-        # Simpler fallback: just return top labels by degree
-        all_nodes = await self._db.query(f"SELECT entity_name FROM {self._ent} LIMIT {limit}")
-        return [r["entity_name"] for r in all_nodes]
+        return [r["entity_name"] for r in rows if "entity_name" in r]
 
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
         rows = await self._db.query(
@@ -430,7 +440,7 @@ class SurrealDBGraphStorage(BaseGraphStorage):
             f"WHERE string::contains(string::lowercase(entity_name), $q) LIMIT {limit}",
             {"q": query.lower()},
         )
-        return [r["entity_name"] for r in rows]
+        return [r["entity_name"] for r in rows if "entity_name" in r]
 
     async def get_all_nodes(self) -> list[dict]:
         return await self._db.query(f"SELECT * FROM {self._ent}")
@@ -440,7 +450,8 @@ class SurrealDBGraphStorage(BaseGraphStorage):
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
         edge_id = f"{source_node_id}___{target_node_id}"
         rows = await self._db.query(
-            f"SELECT id FROM {self._rel} WHERE id = $id LIMIT 1", {"id": edge_id}
+            f"SELECT id FROM {self._rel} WHERE record::id(id) = $id LIMIT 1",
+            {"id": edge_id},
         )
         return bool(rows)
 
@@ -449,7 +460,8 @@ class SurrealDBGraphStorage(BaseGraphStorage):
     ) -> dict[str, str] | None:
         edge_id = f"{source_node_id}___{target_node_id}"
         rows = await self._db.query(
-            f"SELECT * FROM {self._rel} WHERE id = $id LIMIT 1", {"id": edge_id}
+            f"SELECT * FROM {self._rel} WHERE record::id(id) = $id LIMIT 1",
+            {"id": edge_id},
         )
         return rows[0] if rows else None
 
@@ -470,9 +482,9 @@ class SurrealDBGraphStorage(BaseGraphStorage):
 
     async def remove_edges(self, edges: list[tuple[str, str]]) -> None:
         for src, tgt in edges:
-            edge_id = f"{src}___{tgt}"
             await self._db.query(
-                f"DELETE {self._rel} WHERE id = $id", {"id": edge_id}
+                f"DELETE type::thing($t, $id)",
+                {"t": self._rel, "id": f"{src}___{tgt}"},
             )
 
     async def edge_degree(self, src_id: str, tgt_id: str) -> int:
@@ -496,7 +508,6 @@ class SurrealDBGraphStorage(BaseGraphStorage):
     async def get_knowledge_graph(
         self, node_label: str, max_depth: int = 3, max_nodes: int = 1000
     ) -> KnowledgeGraph:
-        """BFS subgraph from node_label up to max_depth hops."""
         kg = KnowledgeGraph()
         visited_nodes: set[str] = set()
         visited_edges: set[tuple[str, str]] = set()
@@ -560,10 +571,7 @@ class SurrealDBGraphStorage(BaseGraphStorage):
 
 @dataclass
 class SurrealDBDocStatusStorage(DocStatusStorage):
-    """
-    Document ingestion status storage.
-    Inherits from DocStatusStorage which itself inherits from BaseKVStorage.
-    """
+    """Document ingestion status tracking."""
 
     def __post_init__(self) -> None:
         self._table = f"doc_status_{self.namespace}"
@@ -586,7 +594,6 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
             DEFINE FIELD IF NOT EXISTS created_at      ON {self._table} TYPE string;
             DEFINE FIELD IF NOT EXISTS updated_at      ON {self._table} TYPE string;
             DEFINE FIELD IF NOT EXISTS metadata        ON {self._table} FLEXIBLE TYPE object;
-            DEFINE INDEX IF NOT EXISTS idx_ds_id       ON {self._table} COLUMNS id UNIQUE;
             DEFINE INDEX IF NOT EXISTS idx_ds_status   ON {self._table} COLUMNS status;
             DEFINE INDEX IF NOT EXISTS idx_ds_hash     ON {self._table} COLUMNS content_hash;
             DEFINE INDEX IF NOT EXISTS idx_ds_path     ON {self._table} COLUMNS file_path;
@@ -609,7 +616,8 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         rows = await self._db.query(
-            f"SELECT * FROM {self._table} WHERE id = $id LIMIT 1", {"id": id}
+            f"SELECT * FROM {self._table} WHERE record::id(id) = $id LIMIT 1",
+            {"id": id},
         )
         return rows[0] if rows else None
 
@@ -617,7 +625,8 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
         if not ids:
             return []
         rows = await self._db.query(
-            f"SELECT * FROM {self._table} WHERE id IN $ids", {"ids": ids}
+            f"SELECT * FROM {self._table} WHERE record::id(id) IN $ids",
+            {"ids": ids},
         )
         row_map = {r["id"]: r for r in rows}
         return [row_map.get(i) for i in ids]
@@ -626,7 +635,8 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
         if not keys:
             return set()
         rows = await self._db.query(
-            f"SELECT id FROM {self._table} WHERE id IN $ids AND status = 'processed'",
+            f"SELECT record::id(id) AS id FROM {self._table} "
+            f"WHERE record::id(id) IN $ids AND status = 'processed'",
             {"ids": list(keys)},
         )
         done = {r["id"] for r in rows}
@@ -643,11 +653,11 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
             )
 
     async def delete(self, ids: list[str]) -> None:
-        if not ids:
-            return
-        await self._db.query(
-            f"DELETE {self._table} WHERE id IN $ids", {"ids": ids}
-        )
+        for id_ in ids:
+            await self._db.query(
+                f"DELETE type::thing($t, $id)",
+                {"t": self._table, "id": id_},
+            )
 
     async def is_empty(self) -> bool:
         rows = await self._db.query(
@@ -693,9 +703,9 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
     async def get_docs_by_statuses(
         self, statuses: list[DocStatus]
     ) -> dict[str, DocProcessingStatus]:
-        vals = [s.value for s in statuses]
         rows = await self._db.query(
-            f"SELECT * FROM {self._table} WHERE status IN $s", {"s": vals}
+            f"SELECT * FROM {self._table} WHERE status IN $s",
+            {"s": [s.value for s in statuses]},
         )
         return {r["id"]: self._row_to_status(r) for r in rows}
 
@@ -716,18 +726,15 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
         sort_field: str = "updated_at",
         sort_direction: str = "desc",
     ) -> tuple[list[tuple[str, DocProcessingStatus]], int]:
-        where = ""
-        bind: dict[str, Any] = {}
+        where, bind = "", {}
         filter_vals = DocStatusStorage.resolve_status_filter_values(
             status_filter, status_filters
         )
         if filter_vals:
             where = "WHERE status IN $statuses"
             bind["statuses"] = list(filter_vals)
-
-        offset = (page - 1) * page_size
         order  = f"ORDER BY {sort_field} {'DESC' if sort_direction == 'desc' else 'ASC'}"
-
+        offset = (page - 1) * page_size
         rows = await self._db.query(
             f"SELECT * FROM {self._table} {where} {order} LIMIT {page_size} START {offset}",
             bind,
@@ -752,9 +759,7 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
             f"SELECT * FROM {self._table} WHERE file_path = $fp LIMIT 1",
             {"fp": basename},
         )
-        if rows:
-            return rows[0]["id"], rows[0]
-        return None
+        return (rows[0]["id"], rows[0]) if rows else None
 
     async def get_doc_by_content_hash(
         self, content_hash: str
@@ -763,6 +768,4 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
             f"SELECT * FROM {self._table} WHERE content_hash = $h LIMIT 1",
             {"h": content_hash},
         )
-        if rows:
-            return rows[0]["id"], rows[0]
-        return None
+        return (rows[0]["id"], rows[0]) if rows else None
