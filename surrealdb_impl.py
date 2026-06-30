@@ -211,7 +211,8 @@ class SurrealDBVectorStorage(BaseVectorStorage):
     """Vector store backed by SurrealDB's native HNSW index."""
 
     def __post_init__(self) -> None:
-        self._validate_embedding_func()
+        if self.embedding_func is None:
+            raise ValueError("embedding_func is required for SurrealDBVectorStorage")
         self._table = f"vec_{self.namespace}"
         self._dim = int(os.getenv("SURREALDB_VECTOR_DIM", "384"))
         self._ef  = int(os.getenv("SURREALDB_HNSW_EF",   "64"))

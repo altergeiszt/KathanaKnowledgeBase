@@ -222,4 +222,5 @@ __marimo__/
 output.txt
 .env
 surrealdb_data
+lightrag_data
 surreal.exe

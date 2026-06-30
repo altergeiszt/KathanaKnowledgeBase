@@ -8,7 +8,7 @@
 lightrag-hku==1.3.9          # Pin to avoid breaking interface changes
 
 # ── SurrealDB ─────────────────────────────────────────────────────────────────
-surrealdb==0.4.0             # Python SDK v2.x async client
+surrealdb==1.0.8             # Python SDK with AsyncSurreal() factory (required by surrealdb_impl.py)
 
 # ── Document extraction ───────────────────────────────────────────────────────
 docling==2.31.0              # PDF extraction with layout understanding
@@ -35,3 +35,4 @@ ollama==0.4.4
 # ── Config & utilities ───────────────────────────────────────────────────────
 python-dotenv==1.0.1         # Load .env files
 pyyaml==6.0.2                # config.yaml parsing
+rich==15.0.0                  # CLI progress bars and logging output

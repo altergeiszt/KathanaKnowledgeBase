@@ -35,6 +35,17 @@ import yaml
 from bs4 import BeautifulSoup
 from datasketch import MinHash, MinHashLSH
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 # docling — pip install docling
 from docling.document_converter import DocumentConverter
@@ -55,8 +66,26 @@ from lightrag.llm.ollama import ollama_model_complete, ollama_embed
 from lightrag.utils import EmbeddingFunc
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+console = Console()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[RichHandler(console=console, show_path=False)],
+)
 logger = logging.getLogger(__name__)
+
+
+def make_progress() -> Progress:
+    """Standard progress bar layout shared by all pipeline stages."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -316,23 +345,23 @@ def apply_content_rules(raw: str, path: Path) -> list[Chunk]:
 # Top-level extraction (called inside multiprocessing.Pool.map)
 # ---------------------------------------------------------------------------
 
-def extract_document(path: Path) -> list[Chunk]:
+def extract_document(path: Path) -> tuple[str, list[Chunk]]:
     """
     Entry point for multiprocessing workers.
     Returns an empty list on any extraction failure (logged, not raised).
     """
     try:
-        logger.info(f"Extracting: {path.name}")
+        logger.debug(f"Extracting: {path.name}")
         if path.suffix.lower() == ".pdf":
             raw = extract_pdf(path)
         elif path.suffix.lower() == ".epub":
             raw = extract_epub(path)
         else:
-            return []
-        return apply_content_rules(raw, path)
+            return path.name, []
+        return path.name, apply_content_rules(raw, path)
     except Exception as exc:
         logger.error(f"Extraction failed for {path}: {exc}")
-        return []
+        return path.name, []
 
 
 # ---------------------------------------------------------------------------
@@ -468,10 +497,14 @@ async def run_pipeline(config: PipelineConfig, reset: bool = False) -> None:
 
     # Stage 3: Parallel extraction (CPU-bound → multiprocessing)
     logger.info(f"Extracting {len(files)} documents using {cpu_count()} workers...")
-    with Pool(processes=cpu_count()) as pool:
-        results: list[list[Chunk]] = pool.map(extract_document, files)
+    all_chunks: list[Chunk] = []
+    with make_progress() as progress, Pool(processes=cpu_count()) as pool:
+        task = progress.add_task("Extracting documents", total=len(files))
+        for name, doc_chunks in pool.imap_unordered(extract_document, files):
+            all_chunks.extend(doc_chunks)
+            progress.update(task, description=f"Extracted {name}")
+            progress.advance(task)
 
-    all_chunks: list[Chunk] = [chunk for doc_chunks in results for chunk in doc_chunks]
     logger.info(f"Extraction complete: {len(all_chunks)} raw chunks")
 
     # Stage 4: Deduplication
@@ -486,7 +519,11 @@ async def run_pipeline(config: PipelineConfig, reset: bool = False) -> None:
     logger.info(f"Inserting {len(chunks)} chunks (concurrency={config.max_concurrent_inserts})...")
     semaphore = asyncio.Semaphore(config.max_concurrent_inserts)
     tasks = [insert_with_semaphore(rag, chunk, semaphore) for chunk in chunks]
-    await asyncio.gather(*tasks)
+    with make_progress() as progress:
+        task = progress.add_task("Inserting chunks", total=len(tasks))
+        for coro in asyncio.as_completed(tasks):
+            await coro
+            progress.advance(task)
 
     logger.info("Ingestion pipeline complete.")
 
