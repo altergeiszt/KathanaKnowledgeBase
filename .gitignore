@@ -222,4 +222,4 @@ __marimo__/
 output.txt
 .env
 surrealdb_data
-
+surreal.exe

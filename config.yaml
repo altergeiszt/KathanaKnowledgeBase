@@ -2,8 +2,8 @@
 # Mounted into the ingest container at /app/config.yaml
 # All values here can be overridden by environment variables in .env
 
-library_path: /library           # path inside the container (do not change)
-working_dir:  /app/lightrag_data  # path inside the container (do not change)
+library_path: ./library
+working_dir:  ./lightrag_data
 
 embedding_model: all-MiniLM-L6-v2
 ollama_model:    qwen2.5:14b
