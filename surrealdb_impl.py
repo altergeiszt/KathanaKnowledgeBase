@@ -269,11 +269,19 @@ class SurrealDBVectorStorage(BaseVectorStorage):
             return {"status": "error", "message": str(e)}
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        for record_id, record_data in data.items():
-            embedding = record_data.get("embedding", [])
-            content   = record_data.get("content", "")
-            metadata  = {k: v for k, v in record_data.items()
-                         if k not in ("embedding", "content")}
+        if not data:
+            return
+        # BaseVectorStorage contract: callers pass raw "content" only —
+        # the storage adapter is responsible for computing embeddings itself
+        # (confirmed against the bundled nano_vector_db_impl.py). Batch all
+        # records in this upsert() call into one embedding_func() call.
+        record_ids = list(data.keys())
+        contents = [data[rid].get("content", "") for rid in record_ids]
+        embeddings = await self.embedding_func(contents)
+        for record_id, embedding in zip(record_ids, embeddings):
+            record_data = data[record_id]
+            content  = record_data.get("content", "")
+            metadata = {k: v for k, v in record_data.items() if k != "content"}
             await self._db.query(
                 f"UPSERT type::thing($t, $id) CONTENT "
                 f"{{content: $c, embedding: $e, metadata: $m}}",
