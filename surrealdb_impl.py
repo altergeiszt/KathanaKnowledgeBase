@@ -9,7 +9,7 @@ SDK notes (current surrealdb Python package):
   - AsyncSurreal(url) is a factory function, not a class.
     surrealkv:// URLs return AsyncEmbeddedSurrealConnection.
   - query() returns results already unwrapped (no 'result' envelope).
-  - IDs come back as RecordID objects; extract the record_id string with str(rid.record_id).
+  - IDs come back as RecordID objects; extract the id string with str(rid.id).
   - IN clauses require RecordID objects, not plain strings; use record::id(id) IN $ids
     with string values as a workaround.
   - signin() is not required for embedded connections.
@@ -49,7 +49,7 @@ def _now_iso() -> str:
 def _id_str(value: Any) -> str:
     """Normalise a RecordID or plain string to just the record ID part."""
     if isinstance(value, RecordID):
-        return str(value.record_id)
+        return str(value.id)
     return str(value)
 
 
@@ -79,6 +79,13 @@ class SurrealDBDB:
         self.database  = os.getenv("SURREALDB_DATABASE",  "assistant")
         self._client   = None
         self._lock     = asyncio.Lock()
+        # Embedded SurrealKV can raise write-write transaction conflicts when
+        # multiple storage classes issue concurrent DDL/writes on the same
+        # connection (e.g. LightRAG's initialize_storages() runs all four
+        # storage classes' initialize() concurrently via asyncio.gather).
+        # Serializing queries avoids this entirely; it's a local embedded
+        # store, so there's no network round-trip cost to losing concurrency.
+        self._query_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         async with self._lock:
@@ -93,13 +100,19 @@ class SurrealDBDB:
     async def query(self, sql: str, vars: dict[str, Any] | None = None) -> list[Any]:
         if self._client is None:
             raise RuntimeError("Call connect() first")
-        result = await self._client.query(sql, vars or {})
+        async with self._query_lock:
+            result = await self._client.query(sql, vars or {})
         if result is None:
             return []
         if isinstance(result, list):
             return [_normalise_row(r) if isinstance(r, dict) else r for r in result]
         if isinstance(result, dict):
             return [_normalise_row(result)]
+        if isinstance(result, str):
+            # On error, this SDK returns the error message as a plain string
+            # instead of raising or returning list/dict — surface it loudly
+            # rather than silently treating it as an empty result.
+            raise RuntimeError(f"SurrealDB query error: {result}\nQuery: {sql}")
         return []
 
     async def close(self) -> None:
@@ -123,6 +136,18 @@ async def get_connection() -> SurrealDBDB:
     return _CONNECTION
 
 
+async def close_connection() -> None:
+    """
+    Closes the shared embedded connection, flushing SurrealKV's write buffer
+    to disk. Safe to call from multiple storage classes' finalize() — the
+    underlying close() is idempotent (no-ops once _client is already None).
+    """
+    global _CONNECTION
+    if _CONNECTION is not None:
+        await _CONNECTION.close()
+        _CONNECTION = None
+
+
 # ---------------------------------------------------------------------------
 # KV Storage
 # ---------------------------------------------------------------------------
@@ -138,13 +163,12 @@ class SurrealDBKVStorage(BaseKVStorage):
     async def initialize(self) -> None:
         self._db = await get_connection()
         await self._db.query(f"""
-            DEFINE TABLE IF NOT EXISTS {self._table} SCHEMAFULL;
-            DEFINE FIELD IF NOT EXISTS id   ON {self._table} TYPE string;
+            DEFINE TABLE IF NOT EXISTS {self._table} SCHEMALESS;
             DEFINE FIELD IF NOT EXISTS data ON {self._table} FLEXIBLE TYPE object;
         """)
 
     async def finalize(self) -> None:
-        pass
+        await close_connection()
 
     async def index_done_callback(self) -> None:
         pass
@@ -186,7 +210,7 @@ class SurrealDBKVStorage(BaseKVStorage):
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         for record_id, record_data in data.items():
             await self._db.query(
-                f"UPSERT type::thing($t, $id) CONTENT {{id: $id, data: $data}}",
+                f"UPSERT type::thing($t, $id) CONTENT {{data: $data}}",
                 {"t": self._table, "id": record_id, "data": record_data},
             )
 
@@ -222,18 +246,17 @@ class SurrealDBVectorStorage(BaseVectorStorage):
     async def initialize(self) -> None:
         self._db = await get_connection()
         await self._db.query(f"""
-            DEFINE TABLE IF NOT EXISTS {self._table} SCHEMAFULL;
-            DEFINE FIELD IF NOT EXISTS id        ON {self._table} TYPE string;
+            DEFINE TABLE IF NOT EXISTS {self._table} SCHEMALESS;
             DEFINE FIELD IF NOT EXISTS content   ON {self._table} TYPE string;
             DEFINE FIELD IF NOT EXISTS embedding ON {self._table} TYPE array<float>;
-            DEFINE FIELD IF NOT EXISTS metadata  ON {self._table} FLEXIBLE TYPE object;
+            DEFINE FIELD IF NOT EXISTS metadata  ON {self._table} FLEXIBLE TYPE option<object>;
             DEFINE INDEX IF NOT EXISTS hnsw_idx  ON {self._table}
                 FIELDS embedding HNSW DIMENSION {self._dim} DIST COSINE
                 EFC {self._ef} M {self._m};
         """)
 
     async def finalize(self) -> None:
-        pass
+        await close_connection()
 
     async def index_done_callback(self) -> None:
         pass
@@ -253,7 +276,7 @@ class SurrealDBVectorStorage(BaseVectorStorage):
                          if k not in ("embedding", "content")}
             await self._db.query(
                 f"UPSERT type::thing($t, $id) CONTENT "
-                f"{{id: $id, content: $c, embedding: $e, metadata: $m}}",
+                f"{{content: $c, embedding: $e, metadata: $m}}",
                 {"t": self._table, "id": record_id,
                  "c": content, "e": embedding, "m": metadata},
             )
@@ -346,29 +369,27 @@ class SurrealDBGraphStorage(BaseGraphStorage):
     async def initialize(self) -> None:
         self._db = await get_connection()
         await self._db.query(f"""
-            DEFINE TABLE IF NOT EXISTS {self._ent} SCHEMAFULL;
-            DEFINE FIELD IF NOT EXISTS id          ON {self._ent} TYPE string;
+            DEFINE TABLE IF NOT EXISTS {self._ent} SCHEMALESS;
             DEFINE FIELD IF NOT EXISTS entity_name ON {self._ent} TYPE string;
             DEFINE FIELD IF NOT EXISTS entity_type ON {self._ent} TYPE string;
             DEFINE FIELD IF NOT EXISTS description ON {self._ent} TYPE string;
             DEFINE FIELD IF NOT EXISTS source_id   ON {self._ent} TYPE string;
-            DEFINE FIELD IF NOT EXISTS extra       ON {self._ent} FLEXIBLE TYPE object;
+            DEFINE FIELD IF NOT EXISTS extra       ON {self._ent} FLEXIBLE TYPE option<object>;
 
-            DEFINE TABLE IF NOT EXISTS {self._rel} SCHEMAFULL;
-            DEFINE FIELD IF NOT EXISTS id          ON {self._rel} TYPE string;
+            DEFINE TABLE IF NOT EXISTS {self._rel} SCHEMALESS;
             DEFINE FIELD IF NOT EXISTS src_id      ON {self._rel} TYPE string;
             DEFINE FIELD IF NOT EXISTS tgt_id      ON {self._rel} TYPE string;
             DEFINE FIELD IF NOT EXISTS weight      ON {self._rel} TYPE float;
             DEFINE FIELD IF NOT EXISTS description ON {self._rel} TYPE string;
             DEFINE FIELD IF NOT EXISTS keywords    ON {self._rel} TYPE array<string>;
             DEFINE FIELD IF NOT EXISTS source_id   ON {self._rel} TYPE string;
-            DEFINE FIELD IF NOT EXISTS extra       ON {self._rel} FLEXIBLE TYPE object;
+            DEFINE FIELD IF NOT EXISTS extra       ON {self._rel} FLEXIBLE TYPE option<object>;
             DEFINE INDEX IF NOT EXISTS idx_rel_src ON {self._rel} COLUMNS src_id;
             DEFINE INDEX IF NOT EXISTS idx_rel_tgt ON {self._rel} COLUMNS tgt_id;
         """)
 
     async def finalize(self) -> None:
-        pass
+        await close_connection()
 
     async def index_done_callback(self) -> None:
         pass
@@ -399,7 +420,7 @@ class SurrealDBGraphStorage(BaseGraphStorage):
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         record_id = node_id.replace(" ", "_").replace("/", "_")
-        payload = {"id": record_id, "entity_name": node_id, **node_data}
+        payload = {"entity_name": node_id, **node_data}
         await self._db.query(
             f"UPSERT type::thing($t, $id) CONTENT $data",
             {"t": self._ent, "id": record_id, "data": payload},
@@ -471,7 +492,6 @@ class SurrealDBGraphStorage(BaseGraphStorage):
     ) -> None:
         edge_id = f"{source_node_id}___{target_node_id}"
         payload = {
-            "id": edge_id,
             "src_id": source_node_id,
             "tgt_id": target_node_id,
             **edge_data,
@@ -581,8 +601,7 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
     async def initialize(self) -> None:
         self._db = await get_connection()
         await self._db.query(f"""
-            DEFINE TABLE IF NOT EXISTS {self._table} SCHEMAFULL;
-            DEFINE FIELD IF NOT EXISTS id              ON {self._table} TYPE string;
+            DEFINE TABLE IF NOT EXISTS {self._table} SCHEMALESS;
             DEFINE FIELD IF NOT EXISTS status          ON {self._table} TYPE string;
             DEFINE FIELD IF NOT EXISTS content_summary ON {self._table} TYPE option<string>;
             DEFINE FIELD IF NOT EXISTS content_length  ON {self._table} TYPE option<int>;
@@ -594,14 +613,14 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
             DEFINE FIELD IF NOT EXISTS track_id        ON {self._table} TYPE option<string>;
             DEFINE FIELD IF NOT EXISTS created_at      ON {self._table} TYPE string;
             DEFINE FIELD IF NOT EXISTS updated_at      ON {self._table} TYPE string;
-            DEFINE FIELD IF NOT EXISTS metadata        ON {self._table} FLEXIBLE TYPE object;
+            DEFINE FIELD IF NOT EXISTS metadata        ON {self._table} FLEXIBLE TYPE option<object>;
             DEFINE INDEX IF NOT EXISTS idx_ds_status   ON {self._table} COLUMNS status;
             DEFINE INDEX IF NOT EXISTS idx_ds_hash     ON {self._table} COLUMNS content_hash;
             DEFINE INDEX IF NOT EXISTS idx_ds_path     ON {self._table} COLUMNS file_path;
         """)
 
     async def finalize(self) -> None:
-        pass
+        await close_connection()
 
     async def index_done_callback(self) -> None:
         pass
@@ -645,7 +664,7 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         for doc_id, doc_data in data.items():
-            payload = {"id": doc_id, "updated_at": _now_iso(), **doc_data}
+            payload = {"updated_at": _now_iso(), **doc_data}
             if "created_at" not in payload:
                 payload["created_at"] = _now_iso()
             await self._db.query(
@@ -670,18 +689,15 @@ class SurrealDBDocStatusStorage(DocStatusStorage):
 
     def _row_to_status(self, row: dict) -> DocProcessingStatus:
         return DocProcessingStatus(
+            content=row.get("content", ""),
             content_summary=row.get("content_summary", ""),
             content_length=row.get("content_length", 0),
             file_path=row.get("file_path", "unknown_source"),
             status=DocStatus(row.get("status", "pending")),
             created_at=row.get("created_at", _now_iso()),
             updated_at=row.get("updated_at", _now_iso()),
-            track_id=row.get("track_id"),
             chunks_count=row.get("chunks_count"),
-            chunks_list=row.get("chunks_list", []),
-            error_msg=row.get("error_msg"),
-            metadata=row.get("metadata", {}),
-            content_hash=row.get("content_hash"),
+            error=row.get("error_msg"),
         )
 
     async def get_status_counts(self) -> dict[str, int]:

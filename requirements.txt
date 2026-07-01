@@ -1,8 +1,14 @@
 # GraphRAG Assistant — Python dependencies
 # Install with: pip install -r requirements.txt
 #
-# GPU note: sentence-transformers will use CUDA automatically if available.
-# For CPU-only environments, everything still works but embedding is slower.
+# GPU note: docling and sentence-transformers both auto-detect CUDA via
+# torch.cuda.is_available() — no code changes needed, just a CUDA-enabled
+# torch build. For CPU-only environments, drop the --extra-index-url line
+# and the "+cu130" suffix below; everything still works, just slower.
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+# ── PyTorch (CUDA build — match to your GPU driver's supported CUDA version) ──
+torch==2.12.1+cu130
 
 # ── LightRAG ─────────────────────────────────────────────────────────────────
 lightrag-hku==1.3.9          # Pin to avoid breaking interface changes

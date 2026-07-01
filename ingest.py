@@ -27,7 +27,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 from pathlib import Path
 from typing import Any
 
@@ -62,10 +62,11 @@ from sentence_transformers import SentenceTransformer
 
 # LightRAG — pip install lightrag-hku
 from lightrag import LightRAG, QueryParam
+from lightrag.kg.shared_storage import initialize_pipeline_status
 from lightrag.llm.ollama import ollama_model_complete, ollama_embed
 from lightrag.utils import EmbeddingFunc
 
-load_dotenv()
+load_dotenv(override=True)
 console = Console()
 logging.basicConfig(
     level=logging.INFO,
@@ -107,6 +108,7 @@ class Chunk:
 class PipelineConfig:
     library_path: Path
     working_dir: Path
+    extraction_workers: int = 8
     max_concurrent_inserts: int = 4
     dedup_threshold: float = 0.85
     dedup_num_perm: int = 128
@@ -133,6 +135,7 @@ def load_config(path: str | None) -> PipelineConfig:
     defaults: dict[str, Any] = {
         "library_path": os.getenv("LIBRARY_PATH", "./library"),
         "working_dir":  os.getenv("LIGHTRAG_WORKING_DIR", "./lightrag_data"),
+        "extraction_workers": int(os.getenv("EXTRACTION_WORKERS", "8")),
         "max_concurrent_inserts": int(os.getenv("MAX_CONCURRENT_INSERTS", "4")),
         "embedding_model": os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
         "ollama_host":  os.getenv("OLLAMA_HOST",  "http://localhost:11434"),
@@ -146,6 +149,7 @@ def load_config(path: str | None) -> PipelineConfig:
     return PipelineConfig(
         library_path=Path(defaults["library_path"]),
         working_dir=Path(defaults["working_dir"]),
+        extraction_workers=defaults["extraction_workers"],
         max_concurrent_inserts=defaults["max_concurrent_inserts"],
         embedding_model=defaults["embedding_model"],
         ollama_host=defaults["ollama_host"],
@@ -442,6 +446,13 @@ async def init_lightrag(config: PipelineConfig) -> LightRAG:
         doc_status_storage="SurrealDBDocStatusStorage",
     )
     await rag.initialize_storages()
+    # Required setup step LightRAG normally does during FastAPI lifespan —
+    # without it, pipeline_status["history_messages"] doesn't exist and the
+    # first ainsert() crashes after setting busy=True but before the
+    # try/finally that would reset it, permanently wedging every later
+    # insert into a silent no-op ("pipeline already busy") for the rest of
+    # the process.
+    await initialize_pipeline_status()
     logger.info("LightRAG initialised with SurrealDB backend")
     return rag
 
@@ -457,22 +468,16 @@ async def insert_with_semaphore(
 ) -> None:
     """
     Insert a single chunk into LightRAG under the semaphore.
-    LightRAG's DocStatusStorage provides implicit checkpointing —
-    documents already marked 'done' are skipped on re-runs.
+    Each chunk is inserted as its own LightRAG "document" — do not pass a
+    shared `ids` value across chunks from the same source file: LightRAG's
+    checkpoint dedup treats a repeated id as "already processed" regardless
+    of content, which would silently drop every chunk after the first one
+    for a given book. Content-hash IDs (the default when `ids` is omitted)
+    keep each chunk independently tracked and idempotent across re-runs.
     """
     async with semaphore:
         try:
-            # Pass source path as doc ID so status is tracked per document
-            await rag.ainsert(
-                chunk.text,
-                metadata={
-                    "source": chunk.source_path,
-                    "content_type": chunk.content_type,
-                    "has_code": bool(chunk.code_blocks),
-                    **chunk.metadata,
-                },
-                doc_id=chunk.source_path,
-            )
+            await rag.ainsert(chunk.text, file_paths=chunk.source_path)
         except Exception as exc:
             logger.error(f"Insert failed for chunk from {chunk.source_path}: {exc}")
 
@@ -489,43 +494,52 @@ async def run_pipeline(config: PipelineConfig, reset: bool = False) -> None:
     # Stage 1: Initialise LightRAG + SurrealDB
     rag = await init_lightrag(config)
 
-    # Stage 2: File discovery
-    files = discover_files(config.library_path)
-    if not files:
-        logger.warning(f"No PDF/EPUB files found under {config.library_path}")
-        return
+    try:
+        # Stage 2: File discovery
+        files = discover_files(config.library_path)
+        if not files:
+            logger.warning(f"No PDF/EPUB files found under {config.library_path}")
+            return
 
-    # Stage 3: Parallel extraction (CPU-bound → multiprocessing)
-    logger.info(f"Extracting {len(files)} documents using {cpu_count()} workers...")
-    all_chunks: list[Chunk] = []
-    with make_progress() as progress, Pool(processes=cpu_count()) as pool:
-        task = progress.add_task("Extracting documents", total=len(files))
-        for name, doc_chunks in pool.imap_unordered(extract_document, files):
-            all_chunks.extend(doc_chunks)
-            progress.update(task, description=f"Extracted {name}")
-            progress.advance(task)
+        # Stage 3: Parallel extraction (CPU-bound → multiprocessing)
+        # NOTE: worker count is capped well below cpu_count() — each worker runs a full
+        # docling+EasyOCR pipeline that can need several GB for large PDFs, so a high
+        # process count risks OOM (workers silently drop documents via MemoryError,
+        # producing a near-empty result set instead of a clean failure).
+        logger.info(f"Extracting {len(files)} documents using {config.extraction_workers} workers...")
+        all_chunks: list[Chunk] = []
+        with make_progress() as progress, Pool(processes=config.extraction_workers) as pool:
+            task = progress.add_task("Extracting documents", total=len(files))
+            for name, doc_chunks in pool.imap_unordered(extract_document, files):
+                all_chunks.extend(doc_chunks)
+                progress.update(task, description=f"Extracted {name}")
+                progress.advance(task)
 
-    logger.info(f"Extraction complete: {len(all_chunks)} raw chunks")
+        logger.info(f"Extraction complete: {len(all_chunks)} raw chunks")
 
-    # Stage 4: Deduplication
-    chunks = deduplicate(
-        all_chunks,
-        threshold=config.dedup_threshold,
-        num_perm=config.dedup_num_perm,
-        k=config.dedup_shingle_k,
-    )
+        # Stage 4: Deduplication
+        chunks = deduplicate(
+            all_chunks,
+            threshold=config.dedup_threshold,
+            num_perm=config.dedup_num_perm,
+            k=config.dedup_shingle_k,
+        )
 
-    # Stage 5: Async insertion into LightRAG / SurrealDB
-    logger.info(f"Inserting {len(chunks)} chunks (concurrency={config.max_concurrent_inserts})...")
-    semaphore = asyncio.Semaphore(config.max_concurrent_inserts)
-    tasks = [insert_with_semaphore(rag, chunk, semaphore) for chunk in chunks]
-    with make_progress() as progress:
-        task = progress.add_task("Inserting chunks", total=len(tasks))
-        for coro in asyncio.as_completed(tasks):
-            await coro
-            progress.advance(task)
+        # Stage 5: Async insertion into LightRAG / SurrealDB
+        logger.info(f"Inserting {len(chunks)} chunks (concurrency={config.max_concurrent_inserts})...")
+        semaphore = asyncio.Semaphore(config.max_concurrent_inserts)
+        tasks = [insert_with_semaphore(rag, chunk, semaphore) for chunk in chunks]
+        with make_progress() as progress:
+            task = progress.add_task("Inserting chunks", total=len(tasks))
+            for coro in asyncio.as_completed(tasks):
+                await coro
+                progress.advance(task)
 
-    logger.info("Ingestion pipeline complete.")
+        logger.info("Ingestion pipeline complete.")
+    finally:
+        # Embedded SurrealKV buffers writes — without this, data can be lost
+        # if the process exits without an explicit flush/close.
+        await rag.finalize_storages()
 
 
 # ---------------------------------------------------------------------------
