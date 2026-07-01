@@ -421,13 +421,18 @@ def make_embedding_func(model_name: str, vector_dim: int) -> EmbeddingFunc:
     return EmbeddingFunc(embedding_dim=vector_dim, max_token_size=512, func=_embed)
 
 
-def make_ollama_func(host: str, model: str):
-    """Build an Ollama LLM func compatible with LightRAG's llm_model_func interface."""
+def make_ollama_func(host: str):
+    """
+    Build an Ollama LLM func compatible with LightRAG's llm_model_func interface.
+    ollama_model_complete() doesn't take a `model` kwarg — it derives the model
+    name internally from kwargs["hashing_kv"].global_config["llm_model_name"],
+    which LightRAG always injects. Passing model= here leaks through into
+    _ollama_model_if_cache's **kwargs and collides with its positional model arg.
+    """
     async def _llm(prompt: str, **kwargs) -> str:
         return await ollama_model_complete(
             prompt,
             host=host,
-            model=model,
             **kwargs,
         )
     return _llm
@@ -438,7 +443,8 @@ async def init_lightrag(config: PipelineConfig) -> LightRAG:
     config.working_dir.mkdir(parents=True, exist_ok=True)
     rag = LightRAG(
         working_dir=str(config.working_dir),
-        llm_model_func=make_ollama_func(config.ollama_host, config.ollama_model),
+        llm_model_func=make_ollama_func(config.ollama_host),
+        llm_model_name=config.ollama_model,
         embedding_func=make_embedding_func(config.embedding_model, config.vector_dim),
         kv_storage="SurrealDBKVStorage",
         vector_storage="SurrealDBVectorStorage",
