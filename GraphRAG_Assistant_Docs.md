@@ -91,7 +91,7 @@ The system has a single user: a technically proficient software developer with s
 | **No RAPIDS** | RAPIDS/cuGraph not used; CUDA acceleration limited to sentence-transformers embeddings |
 | **Python Pipeline** | Ingestion pipeline implemented in Python using asyncio and multiprocessing |
 
-### 2.5 Assumptions and Dependencies
+### 2.5 Assumptions and Dependencies // Edit
 
 - SurrealDB Python SDK v2.0+ is available and stable
 - LightRAG's storage adapter interface (`BaseKVStorage`, `BaseVectorStorage`, `BaseGraphStorage`) remains stable across minor versions
@@ -109,12 +109,12 @@ The system has a single user: a technically proficient software developer with s
 |----|-------------|----------|--------|
 | FR-I-01 | The system shall extract plain text from PDF files using docling, preserving section and paragraph structure | High | Core |
 | FR-I-02 | The system shall extract chapter-level text from EPUB files using ebooklib and BeautifulSoup | High | Core |
-| FR-I-03 | The system shall strip code blocks from software development books and tag them separately as `[CODE]` blocks with adjacent `[PROSE]` context | High | Core |
+| FR-I-03 | The system shall strip code blocks from software development books and tag them separately as `[CODE]` blocks with adjacent `[PROSE]` context | High | Core | // Edit
 | FR-I-04 | The system shall extract prose-only content from mathematics books, skipping formula notation that fails to convert cleanly | Medium | Core |
 | FR-I-05 | The system shall perform near-duplicate detection across all extracted text using MinHash LSH (datasketch) prior to indexing | High | Cost |
 | FR-I-06 | The system shall use multiprocessing for PDF and EPUB extraction (CPU-bound) and asyncio for LLM API calls (I/O-bound) | Medium | Performance |
-| FR-I-07 | The system shall checkpoint ingestion progress so that a failed run resumes from the last successful document | High | Reliability |
-| FR-I-08 | The system shall support four text chunking strategies: Fix, Recursive, Vector, and Paragraph, configurable per content type | Medium | Core |
+| FR-I-07 | The system shall checkpoint ingestion progress so that a failed run resumes from the last successful document | High | Reliability | // Edit
+| FR-I-08 | The system shall support four text chunking strategies: Fix, Recursive, Vector, and Paragraph, configurable per content type | Medium | Core | // Edit
 
 ### 3.2 Embedding and Indexing
 
@@ -146,16 +146,16 @@ The system has a single user: a technically proficient software developer with s
 | FR-S-02 | The adapter shall implement `BaseVectorStorage` for embedding storage and HNSW similarity search | High | Core |
 | FR-S-03 | The adapter shall implement `BaseGraphStorage` for knowledge graph node and edge operations | High | Core |
 | FR-S-04 | The adapter shall implement `BaseDocStatusStorage` for document processing state tracking | Medium | Core |
-| FR-S-05 | The adapter shall use the surrealdb Python SDK v2.0+ with async/await throughout | High | Core |
+| FR-S-05 | The adapter shall use the surrealdb Python SDK v2.0+ with async/await throughout | High | Core | // Edit
 | FR-S-06 | The adapter shall support LightRAG workspace/namespace isolation for multi-tenant use (future GraphNotes) | Medium | GraphNotes |
-| FR-S-07 | The adapter shall be registered in LightRAG's `kg/__init__.py` storage registry under the name `SurrealDBStorage` | High | Core |
+| FR-S-07 | The adapter shall be registered in LightRAG's `kg/__init__.py` storage registry under the name `SurrealDBStorage` | High | Core | // Edit
 
 ### 3.5 Front-End and API
 
 | ID | Requirement | Priority | Source |
 |----|-------------|----------|--------|
 | FR-F-01 | OpenWebUI shall connect to the system via a FastAPI bridge implementing an Ollama-compatible API | High | Core |
-| FR-F-02 | The FastAPI bridge shall handle conversation history and pass full context to LightRAG on each turn | High | Core |
+| FR-F-02 | The FastAPI bridge shall handle conversation history and pass full context to LightRAG on each turn | High | Core | // Edit
 | FR-F-03 | The system shall provide a LightRAG knowledge graph visualization endpoint compatible with the built-in LightRAG WebUI | Low | Optional |
 
 ---
@@ -300,7 +300,7 @@ Recommended starting models:
 Embeddings are stored directly in SurrealDB with HNSW indexing. The embedding dimension is fixed at schema creation time. HNSW parameters (`ef_construction`, `m`) should be tuned for the expected corpus size (~500K–2M chunks estimated).
 
 ### 2.5 Concurrency Model
-
+// Edit
 | Stage | Concurrency Model | Reason |
 |-------|-------------------|--------|
 | PDF/EPUB Extraction | `multiprocessing.Pool` | CPU-bound; bypasses GIL |
@@ -316,7 +316,7 @@ Embeddings are stored directly in SurrealDB with HNSW indexing. The embedding di
 SurrealDB serves as the single unified storage backend, replacing the combination of Qdrant (vector), Neo4j (graph), and a KV store that many LightRAG deployments require. This unification is a core architectural decision driven by GraphNotes compatibility.
 
 ### 3.1 LightRAG Storage Interface
-
+// Edit
 LightRAG defines four abstract base classes in `lightrag/base.py` that all storage backends must implement:
 
 | Interface | Responsibility | SurrealDB Table(s) |
@@ -327,7 +327,7 @@ LightRAG defines four abstract base classes in `lightrag/base.py` that all stora
 | `BaseDocStatusStorage` | Tracks per-document ingestion state (pending, processing, done, failed) | `doc_status_{namespace}` |
 
 ### 3.2 SurrealDB Schema Design
-
+// Edit to conform with current implementation
 #### 3.2.1 Vector Store Table
 
 ```sql
@@ -363,7 +363,7 @@ DEFINE FIELD keywords    ON relation_default TYPE array<string>;
 ```
 
 ### 3.3 Adapter Registration
-
+// Edit to conform weth patch_lightrag.py
 The SurrealDB adapter is registered in LightRAG's storage factory in `lightrag/kg/__init__.py`:
 
 ```python
@@ -426,7 +426,7 @@ FastAPI exposes an Ollama-compatible REST API that OpenWebUI connects to. Key en
 The bridge maintains no persistent state; all conversation history is passed by the client on each request and forwarded to LightRAG as context.
 
 ### 4.4 Reranker
-
+// Confirm use case 
 When using `mix` mode, a reranker model re-scores retrieved chunks before assembly into the context window. Recommended: `BAAI/bge-reranker-v2-m3`, run locally. This significantly improves relevance for mixed-content queries (e.g., a query requiring both a conceptual explanation and a code reference).
 
 ---
@@ -1036,7 +1036,7 @@ Orchestrates file discovery, parallel extraction, deduplication, and LightRAG in
 
 ```bash
 python ingest.py --config config.yaml
-python ingest.py --reset   # drop and rebuild all SurrealDB tables
+python ingest.py --reset   # drop and rebuild all SurrealDB tables, check to confirm use case
 ```
 
 Key design decisions baked in:
@@ -1436,7 +1436,7 @@ def make_embedding_func(model_name: str, vector_dim: int) -> EmbeddingFunc:
     return EmbeddingFunc(embedding_dim=vector_dim, max_token_size=512, func=_embed)
 
 
-def make_ollama_func(host: str, model: str):
+def make_ollama_func(host: str, model: str): # Check to confirm use case
     """Build an Ollama LLM func compatible with LightRAG's llm_model_func interface."""
     async def _llm(prompt: str, **kwargs) -> str:
         return await ollama_model_complete(
@@ -1460,7 +1460,7 @@ async def init_lightrag(config: PipelineConfig) -> LightRAG:
         graph_storage="SurrealDBGraphStorage",
         doc_status_storage="SurrealDBDocStatusStorage",
     )
-    await rag.initialize_storages()
+    await rag.initialize_storages() # Confirm use case
     logger.info("LightRAG initialised with SurrealDB backend")
     return rag
 
@@ -1928,7 +1928,7 @@ async def graph_data() -> dict[str, Any]:
 
 ---
 
-## 4. Testing Strategy
+## 4. Testing Strategy // Modify
 
 ### 4.1 Unit Tests — Adapter
 
