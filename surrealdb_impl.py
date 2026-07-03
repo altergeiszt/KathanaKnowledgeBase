@@ -389,7 +389,7 @@ class SurrealDBGraphStorage(BaseGraphStorage):
             DEFINE FIELD IF NOT EXISTS tgt_id      ON {self._rel} TYPE string;
             DEFINE FIELD IF NOT EXISTS weight      ON {self._rel} TYPE float;
             DEFINE FIELD IF NOT EXISTS description ON {self._rel} TYPE string;
-            DEFINE FIELD IF NOT EXISTS keywords    ON {self._rel} TYPE array<string>;
+            DEFINE FIELD IF NOT EXISTS keywords    ON {self._rel} TYPE string;
             DEFINE FIELD IF NOT EXISTS source_id   ON {self._rel} TYPE string;
             DEFINE FIELD IF NOT EXISTS extra       ON {self._rel} FLEXIBLE TYPE option<object>;
             DEFINE INDEX IF NOT EXISTS idx_rel_src ON {self._rel} COLUMNS src_id;
