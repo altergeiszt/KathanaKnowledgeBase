@@ -1,7 +1,7 @@
 """
 lightrag/kg/surrealdb_impl.py
 
-SurrealDB storage adapter for LightRAG 1.5.4.
+SurrealDB storage adapter for LightRAG 1.3.9 (pinned in requirements.txt).
 Uses an EMBEDDED SurrealKV connection — no separate SurrealDB server needed.
 The database file lives at SURREALDB_PATH (default: ./lightrag_data/graphrag.db).
 

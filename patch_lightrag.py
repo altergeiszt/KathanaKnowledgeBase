@@ -1,7 +1,7 @@
 """
 patch_lightrag.py
 
-Registers the SurrealDB storage adapter in LightRAG 1.5.4.
+Registers the SurrealDB storage adapter in LightRAG 1.3.9 (pinned in requirements.txt).
 Safe to re-run — all operations are idempotent.
 
 Three things it does:

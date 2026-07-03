@@ -1,6 +1,7 @@
 # GraphRAG Personal AI Assistant — Documentation
 
-> Version 1.0 · June 2026 · Status: Draft
+> Version 1.1 · June 2026 · Status: Draft
+> _Reconciled 2026-07-03 against the implementation (embedded SurrealKV model). Full-source listings in TDD §1.3/§2/§3 are retained for design intent but carry ⚠️ banners where they diverge from the shipped code, which is authoritative._
 
 ---
 
@@ -91,10 +92,10 @@ The system has a single user: a technically proficient software developer with s
 | **No RAPIDS** | RAPIDS/cuGraph not used; CUDA acceleration limited to sentence-transformers embeddings |
 | **Python Pipeline** | Ingestion pipeline implemented in Python using asyncio and multiprocessing |
 
-### 2.5 Assumptions and Dependencies // Edit
+### 2.5 Assumptions and Dependencies
 
-- SurrealDB Python SDK v2.0+ is available and stable
-- LightRAG's storage adapter interface (`BaseKVStorage`, `BaseVectorStorage`, `BaseGraphStorage`) remains stable across minor versions
+- SurrealDB Python SDK `1.0.8` is used, providing the `AsyncSurreal()` factory and embedded `surrealkv://` connections (no separate SurrealDB server process). The originally-assumed v2.0+ SDK is **not** used — see Architecture §3 and TDD §1.
+- LightRAG is pinned to `1.3.9`; its storage adapter interface (`BaseKVStorage`, `BaseVectorStorage`, `BaseGraphStorage`, `BaseDocStatusStorage`) is assumed stable only within that pin. Upgrades require re-validating the adapter.
 - Ollama supports Qwen2.5:14B at Q4 quantization within 16 GB VRAM
 - The ebook library (~14 GB) is accessible on local disk in EPUB and PDF format
 - `docling` is used as the primary extraction tool for PDFs due to its superior layout handling
@@ -109,12 +110,14 @@ The system has a single user: a technically proficient software developer with s
 |----|-------------|----------|--------|
 | FR-I-01 | The system shall extract plain text from PDF files using docling, preserving section and paragraph structure | High | Core |
 | FR-I-02 | The system shall extract chapter-level text from EPUB files using ebooklib and BeautifulSoup | High | Core |
-| FR-I-03 | The system shall strip code blocks from software development books and tag them separately as `[CODE]` blocks with adjacent `[PROSE]` context | High | Core | // Edit
+| FR-I-03 | The system shall strip code blocks from software development books during extraction and index the surrounding prose only. Code blocks are detected and removed from the chunk text; they are **not** forwarded to the index as `[CODE]`/`[PROSE]` tagged metadata (that forwarding was dropped — the index is prose-only) | Medium | Core |
 | FR-I-04 | The system shall extract prose-only content from mathematics books, skipping formula notation that fails to convert cleanly | Medium | Core |
 | FR-I-05 | The system shall perform near-duplicate detection across all extracted text using MinHash LSH (datasketch) prior to indexing | High | Cost |
 | FR-I-06 | The system shall use multiprocessing for PDF and EPUB extraction (CPU-bound) and asyncio for LLM API calls (I/O-bound) | Medium | Performance |
-| FR-I-07 | The system shall checkpoint ingestion progress so that a failed run resumes from the last successful document | High | Reliability | // Edit
-| FR-I-08 | The system shall support four text chunking strategies: Fix, Recursive, Vector, and Paragraph, configurable per content type | Medium | Core | // Edit
+| FR-I-07 | The system shall checkpoint ingestion progress via per-document status tracking (`SurrealDBDocStatusStorage`), so that re-running the pipeline skips documents already marked processed and resumes the remainder | High | Reliability |
+| FR-I-08 | The system shall support four text chunking strategies: Fix, Recursive, Vector, and Paragraph, configurable per content type | Medium | Core |
+
+> **FR-I-08 status:** standing commitment, **not yet implemented**. The current pipeline always uses a single `semantic_text_splitter.TextSplitter`. Retained as a requirement per project decision (2026-07-03).
 
 ### 3.2 Embedding and Indexing
 
@@ -133,10 +136,10 @@ The system has a single user: a technically proficient software developer with s
 |----|-------------|----------|--------|
 | FR-Q-01 | The system shall support LightRAG query modes: local, global, hybrid, naive, and mix | High | Core |
 | FR-Q-02 | The system shall route queries to Claude Haiku (API) or Qwen2.5:14B (local) based on configuration | Medium | Core |
-| FR-Q-03 | The system shall return source citations alongside answers, indicating the originating document and section | High | Core |
+| FR-Q-03 | The system shall return source citations alongside answers, indicating the originating document and section | Low | Future/Optional |
 | FR-Q-04 | The system shall expose a REST API via FastAPI for integration with OpenWebUI | High | Core |
 | FR-Q-05 | The system shall support streaming responses for real-time display in OpenWebUI | Medium | UX |
-| FR-Q-06 | The system shall support separate LLM role configuration: EXTRACT, QUERY, KEYWORDS roles may use different models | Medium | Core |
+| FR-Q-06 | The system shall support independent configuration of the QUERY-role model (Ollama or Anthropic, selectable at query time). Fully independent per-role models for EXTRACT and KEYWORDS are **future/optional** — currently EXTRACT and KEYWORDS share one Ollama model | Low | Future/Optional |
 
 ### 3.4 SurrealDB Storage Adapter
 
@@ -146,16 +149,16 @@ The system has a single user: a technically proficient software developer with s
 | FR-S-02 | The adapter shall implement `BaseVectorStorage` for embedding storage and HNSW similarity search | High | Core |
 | FR-S-03 | The adapter shall implement `BaseGraphStorage` for knowledge graph node and edge operations | High | Core |
 | FR-S-04 | The adapter shall implement `BaseDocStatusStorage` for document processing state tracking | Medium | Core |
-| FR-S-05 | The adapter shall use the surrealdb Python SDK v2.0+ with async/await throughout | High | Core | // Edit
+| FR-S-05 | The adapter shall use the surrealdb Python SDK `1.0.8` (`AsyncSurreal()` factory) with async/await throughout, over an embedded `surrealkv://` connection | High | Core |
 | FR-S-06 | The adapter shall support LightRAG workspace/namespace isolation for multi-tenant use (future GraphNotes) | Medium | GraphNotes |
-| FR-S-07 | The adapter shall be registered in LightRAG's `kg/__init__.py` storage registry under the name `SurrealDBStorage` | High | Core | // Edit
+| FR-S-07 | The adapter shall register four separately-named storage classes — `SurrealDBKVStorage`, `SurrealDBVectorStorage`, `SurrealDBGraphStorage`, `SurrealDBDocStatusStorage` — into LightRAG's storage registry. Registration is performed by a one-time setup script, `patch_lightrag.py`, which copies `surrealdb_impl.py` into the installed `lightrag/kg/` package and edits `kg/__init__.py` on disk (`STORAGES`, `STORAGE_IMPLEMENTATIONS`, `STORAGE_ENV_REQUIREMENTS`). It is idempotent and safe to re-run | High | Core |
 
 ### 3.5 Front-End and API
 
 | ID | Requirement | Priority | Source |
 |----|-------------|----------|--------|
 | FR-F-01 | OpenWebUI shall connect to the system via a FastAPI bridge implementing an Ollama-compatible API | High | Core |
-| FR-F-02 | The FastAPI bridge shall handle conversation history and pass full context to LightRAG on each turn | High | Core | // Edit
+| FR-F-02 | The FastAPI bridge shall handle conversation history and pass it into LightRAG retrieval (`QueryParam.conversation_history`, `history_turns=3`) on each turn, so follow-up queries are resolved against prior turns — not merely appended to the final generation prompt | High | Core |
 | FR-F-03 | The system shall provide a LightRAG knowledge graph visualization endpoint compatible with the built-in LightRAG WebUI | Low | Optional |
 
 ---
@@ -300,14 +303,15 @@ Recommended starting models:
 Embeddings are stored directly in SurrealDB with HNSW indexing. The embedding dimension is fixed at schema creation time. HNSW parameters (`ef_construction`, `m`) should be tuned for the expected corpus size (~500K–2M chunks estimated).
 
 ### 2.5 Concurrency Model
-// Edit
+
 | Stage | Concurrency Model | Reason |
 |-------|-------------------|--------|
-| PDF/EPUB Extraction | `multiprocessing.Pool` | CPU-bound; bypasses GIL |
-| Chunking & Dedup | `multiprocessing.Pool` | CPU-bound |
+| PDF/EPUB Extraction | `multiprocessing.Pool(processes=extraction_workers)` | CPU-bound; bypasses GIL. Worker count is **capped** by the `extraction_workers` config (default 8, override `EXTRACTION_WORKERS`) rather than `cpu_count()` — each worker runs a full docling+EasyOCR pipeline that can need several GB, so an uncapped pool risks OOM |
+| Chunking | In-process (inside each extraction worker) | Chunking runs as part of `extract_document()` |
+| Deduplication | Single process (MinHash LSH) | Runs once over the combined chunk set after extraction |
 | Embedding Generation | Batched GPU inference | GPU parallelism via sentence-transformers |
 | LightRAG Entity Extraction (Ollama) | `asyncio` + LightRAG internal async | I/O-bound; GIL releases on network wait |
-| SurrealDB Writes | `asyncio` | I/O-bound async operations |
+| SurrealDB Writes | `asyncio`, **serialized** via an internal `_query_lock` | Embedded SurrealKV raises write-write transaction conflicts under concurrent writes on one connection; there is no network round-trip cost to serializing a local store |
 
 ---
 
@@ -316,64 +320,90 @@ Embeddings are stored directly in SurrealDB with HNSW indexing. The embedding di
 SurrealDB serves as the single unified storage backend, replacing the combination of Qdrant (vector), Neo4j (graph), and a KV store that many LightRAG deployments require. This unification is a core architectural decision driven by GraphNotes compatibility.
 
 ### 3.1 LightRAG Storage Interface
-// Edit
-LightRAG defines four abstract base classes in `lightrag/base.py` that all storage backends must implement:
+
+LightRAG defines four abstract base classes in `lightrag/base.py` that all storage backends must implement. The SurrealDB tables use short prefixes (`kv_`, `vec_`, `ent_`, `rel_`, `doc_status_`):
 
 | Interface | Responsibility | SurrealDB Table(s) |
 |-----------|---------------|-------------------|
-| `BaseKVStorage` | Stores key-value pairs: entity summaries, LLM response cache, community reports | `kv_store_{namespace}` |
-| `BaseVectorStorage` | Stores embedding vectors and supports HNSW ANN similarity search | `vector_store_{namespace}` |
-| `BaseGraphStorage` | Stores knowledge graph: nodes (entities), edges (relationships), supports traversal | `entity_{namespace}`, `relation_{namespace}` |
-| `BaseDocStatusStorage` | Tracks per-document ingestion state (pending, processing, done, failed) | `doc_status_{namespace}` |
+| `BaseKVStorage` | Stores key-value pairs: entity summaries, LLM response cache, community reports | `kv_{namespace}` |
+| `BaseVectorStorage` | Stores embedding vectors and supports HNSW ANN similarity search | `vec_{namespace}` |
+| `BaseGraphStorage` | Stores knowledge graph: nodes (entities), edges (relationships), supports traversal | `ent_{namespace}`, `rel_{namespace}` |
+| `BaseDocStatusStorage` | Tracks per-document ingestion state (pending, processing, processed, failed) | `doc_status_{namespace}` |
 
 ### 3.2 SurrealDB Schema Design
-// Edit to conform with current implementation
-#### 3.2.1 Vector Store Table
+
+Tables are declared **`SCHEMALESS`** (not `SCHEMAFULL`), with `DEFINE FIELD ... IF NOT EXISTS` guiding the expected shape while allowing LightRAG to attach extra fields. `object`/metadata fields are declared `FLEXIBLE`. Record IDs are SurrealDB `RecordID`s; the adapter normalizes them to plain strings via `record::id(id)`. Examples below use the `default` namespace (the LightRAG workspace name).
+
+> ⚠️ **Schema stability contract (SRS §5.3).** The table prefixes (`kv_`, `vec_`, `ent_`, `rel_`, `doc_status_`) and the field names below are the **frozen contract** for future GraphNotes integration, as of 2026-07-03. They intentionally differ from the earlier `kv_store_`/`vector_store_`/`entity_`/`relation_` draft names. Changing them post-integration requires a coordinated migration.
+
+#### 3.2.1 KV Store Table
 
 ```sql
-DEFINE TABLE vector_store_default SCHEMAFULL;
-DEFINE FIELD id        ON vector_store_default TYPE string;
-DEFINE FIELD content   ON vector_store_default TYPE string;
-DEFINE FIELD embedding ON vector_store_default TYPE array<float>;
-DEFINE FIELD metadata  ON vector_store_default TYPE object;
-DEFINE INDEX hnsw_idx  ON vector_store_default
-  FIELDS embedding HNSW DIMENSION 384 DIST COSINE;
+DEFINE TABLE IF NOT EXISTS kv_default SCHEMALESS;
+DEFINE FIELD IF NOT EXISTS data ON kv_default FLEXIBLE TYPE object;
 ```
 
-#### 3.2.2 Entity (Graph Node) Table
+#### 3.2.2 Vector Store Table
 
 ```sql
-DEFINE TABLE entity_default SCHEMAFULL;
-DEFINE FIELD id          ON entity_default TYPE string;
-DEFINE FIELD name        ON entity_default TYPE string;
-DEFINE FIELD type        ON entity_default TYPE string;
-DEFINE FIELD description ON entity_default TYPE string;
-DEFINE FIELD source_id   ON entity_default TYPE string;
+DEFINE TABLE IF NOT EXISTS vec_default SCHEMALESS;
+DEFINE FIELD IF NOT EXISTS content   ON vec_default TYPE string;
+DEFINE FIELD IF NOT EXISTS embedding ON vec_default TYPE array<float>;
+DEFINE FIELD IF NOT EXISTS metadata  ON vec_default FLEXIBLE TYPE option<object>;
+DEFINE INDEX IF NOT EXISTS hnsw_idx  ON vec_default
+  FIELDS embedding HNSW DIMENSION 384 DIST COSINE EFC 64 M 16;
 ```
 
-#### 3.2.3 Relation (Graph Edge) Table
+#### 3.2.3 Entity (Graph Node) Table
 
 ```sql
-DEFINE TABLE relation_default SCHEMAFULL;
-DEFINE FIELD src_id      ON relation_default TYPE string;
-DEFINE FIELD tgt_id      ON relation_default TYPE string;
-DEFINE FIELD weight      ON relation_default TYPE float;
-DEFINE FIELD description ON relation_default TYPE string;
-DEFINE FIELD keywords    ON relation_default TYPE array<string>;
+DEFINE TABLE IF NOT EXISTS ent_default SCHEMALESS;
+DEFINE FIELD IF NOT EXISTS entity_name ON ent_default TYPE string;
+DEFINE FIELD IF NOT EXISTS entity_type ON ent_default TYPE string;
+DEFINE FIELD IF NOT EXISTS description ON ent_default TYPE string;
+DEFINE FIELD IF NOT EXISTS source_id   ON ent_default TYPE string;
+DEFINE FIELD IF NOT EXISTS extra       ON ent_default FLEXIBLE TYPE option<object>;
+```
+
+#### 3.2.4 Relation (Graph Edge) Table
+
+```sql
+DEFINE TABLE IF NOT EXISTS rel_default SCHEMALESS;
+DEFINE FIELD IF NOT EXISTS src_id      ON rel_default TYPE string;
+DEFINE FIELD IF NOT EXISTS tgt_id      ON rel_default TYPE string;
+DEFINE FIELD IF NOT EXISTS weight      ON rel_default TYPE float;
+DEFINE FIELD IF NOT EXISTS description ON rel_default TYPE string;
+DEFINE FIELD IF NOT EXISTS keywords    ON rel_default TYPE string;   -- NOTE: string, not array<string>
+DEFINE FIELD IF NOT EXISTS source_id   ON rel_default TYPE string;
+DEFINE INDEX IF NOT EXISTS idx_rel_src ON rel_default COLUMNS src_id;
+DEFINE INDEX IF NOT EXISTS idx_rel_tgt ON rel_default COLUMNS tgt_id;
+```
+
+#### 3.2.5 Doc Status Table
+
+```sql
+DEFINE TABLE IF NOT EXISTS doc_status_default SCHEMALESS;
+DEFINE FIELD IF NOT EXISTS status       ON doc_status_default TYPE string;
+DEFINE FIELD IF NOT EXISTS content_hash ON doc_status_default TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS file_path    ON doc_status_default TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS track_id     ON doc_status_default TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS error_msg    ON doc_status_default TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS metadata     ON doc_status_default FLEXIBLE TYPE option<object>;
+-- plus content_summary, content_length, chunks_count, chunks_list, created_at, updated_at
+DEFINE INDEX IF NOT EXISTS idx_ds_status ON doc_status_default COLUMNS status;
+DEFINE INDEX IF NOT EXISTS idx_ds_hash   ON doc_status_default COLUMNS content_hash;
+DEFINE INDEX IF NOT EXISTS idx_ds_path   ON doc_status_default COLUMNS file_path;
 ```
 
 ### 3.3 Adapter Registration
-// Edit to conform weth patch_lightrag.py
-The SurrealDB adapter is registered in LightRAG's storage factory in `lightrag/kg/__init__.py`:
 
-```python
-STORAGE_IMPLEMENTATIONS["SurrealDBKVStorage"]        = "lightrag.kg.surrealdb_impl.SurrealDBKVStorage"
-STORAGE_IMPLEMENTATIONS["SurrealDBVectorStorage"]    = "lightrag.kg.surrealdb_impl.SurrealDBVectorStorage"
-STORAGE_IMPLEMENTATIONS["SurrealDBGraphStorage"]     = "lightrag.kg.surrealdb_impl.SurrealDBGraphStorage"
-STORAGE_IMPLEMENTATIONS["SurrealDBDocStatusStorage"] = "lightrag.kg.surrealdb_impl.SurrealDBDocStatusStorage"
-```
+Registration is performed by a **one-time setup script**, `patch_lightrag.py` (run explicitly as `python patch_lightrag.py`, e.g. via `setup.ps1`). It is not a runtime import — it physically modifies the installed LightRAG package on disk, and must be re-run after any reinstall/upgrade of `lightrag-hku`. Three idempotent steps:
 
-LightRAG initialization using the SurrealDB backend:
+1. **Copies** `surrealdb_impl.py` into the installed `lightrag/kg/` directory so it is importable as `lightrag.kg.surrealdb_impl`.
+2. **Rewrites** `lightrag/kg/__init__.py` via string manipulation, adding the four class names to the `STORAGES` dict and to the per-role `STORAGE_IMPLEMENTATIONS[...]["implementations"]` lists (`KV_STORAGE`, `VECTOR_STORAGE`, `GRAPH_STORAGE`, `DOC_STATUS_STORAGE`).
+3. **Adds** empty `STORAGE_ENV_REQUIREMENTS` entries for each class (the embedded adapter needs no env-var preconditions).
+
+After patching, LightRAG resolves the classes by name exactly as for its built-in backends. Once registered, LightRAG is initialized with the SurrealDB backend:
 
 ```python
 rag = LightRAG(
@@ -410,9 +440,11 @@ LightRAG 2026 supports independent LLM configuration per role. The system uses t
 | Role | Function | Assigned Model |
 |------|----------|---------------|
 | `EXTRACT` | Entity/relationship extraction during ingestion | Qwen2.5:14B via Ollama (local, free) |
-| `KEYWORDS` | Query keyword inference for graph lookup | Qwen2.5:14B via Ollama (local, fast) |
-| `QUERY` | Final answer generation from retrieved context | Claude Haiku via API (or Qwen2.5:14B if cost-sensitive) |
+| `KEYWORDS` | Query keyword inference for graph lookup | Qwen2.5:14B via Ollama (shares the EXTRACT model — see note) |
+| `QUERY` | Final answer generation from retrieved context | Claude Haiku via API, or Qwen2.5:14B locally (`QUERY_LLM_PROVIDER`) |
 | `VLM` | Vision/multimodal (future use for diagram-heavy content) | Not configured initially |
+
+> **Role-separation status.** Only the **QUERY** role is independently configurable today (via `QUERY_LLM_PROVIDER` = `ollama` | `anthropic` in `api.py`). EXTRACT and KEYWORDS both run through the single Ollama model built by `make_ollama_func()`; a separately-configured KEYWORDS model is **future/optional** (FR-Q-06).
 
 ### 4.3 API Bridge (FastAPI)
 
@@ -425,9 +457,11 @@ FastAPI exposes an Ollama-compatible REST API that OpenWebUI connects to. Key en
 
 The bridge maintains no persistent state; all conversation history is passed by the client on each request and forwarded to LightRAG as context.
 
-### 4.4 Reranker
-// Confirm use case 
-When using `mix` mode, a reranker model re-scores retrieved chunks before assembly into the context window. Recommended: `BAAI/bge-reranker-v2-m3`, run locally. This significantly improves relevance for mixed-content queries (e.g., a query requiring both a conceptual explanation and a code reference).
+### 4.4 Reranker (Future/Optional — not implemented)
+
+> **Status:** deferred per project decision (2026-07-03). No reranker is wired in; `mix` mode currently returns LightRAG's combined graph+vector retrieval without a re-scoring pass.
+
+The intended design: when using `mix` mode, a reranker model re-scores retrieved chunks before assembly into the context window. Recommended: `BAAI/bge-reranker-v2-m3`, run locally. This would improve relevance for mixed-content queries (e.g., a query requiring both a conceptual explanation and a code reference). Revisit if `mix`-mode answer quality proves insufficient.
 
 ---
 
@@ -440,7 +474,7 @@ The standalone pipeline is architecturally designed as Phase 1 of a two-phase de
 | Component | Technology | Notes |
 |-----------|------------|-------|
 | Ingestion | Python pipeline | Runs once; re-runs on library updates |
-| Storage | SurrealDB (standalone server) | Same instance GraphNotes will use |
+| Storage | SurrealDB — embedded SurrealKV file (`surrealkv://`) | Same on-disk database GraphNotes will open |
 | LLM Inference | Ollama (local) | Shared with GraphNotes future use |
 | Query API | FastAPI bridge | Replaced by native Rust bridge in Phase 2 |
 | Front-End | OpenWebUI | Replaced by GraphNotes UI in Phase 2 |
@@ -468,42 +502,60 @@ This phase is optional and only warranted if the sidecar approach proves insuffi
 
 The SurrealDB adapter is the central technical deliverable. It bridges LightRAG's abstract storage interfaces and SurrealDB's multi-model capabilities, making SurrealDB a drop-in replacement for the Qdrant + Neo4j + Redis combination that production LightRAG deployments typically require.
 
-Register the four classes in `lightrag/kg/__init__.py`:
+The four classes are registered by the one-time `patch_lightrag.py` setup script (see Architecture §3.3), which copies the adapter into and edits the installed LightRAG package on disk. After patching, LightRAG's `kg/__init__.py` contains, in effect:
 
 ```python
-STORAGE_IMPLEMENTATIONS["SurrealDBKVStorage"]        = "lightrag.kg.surrealdb_impl.SurrealDBKVStorage"
-STORAGE_IMPLEMENTATIONS["SurrealDBVectorStorage"]    = "lightrag.kg.surrealdb_impl.SurrealDBVectorStorage"
-STORAGE_IMPLEMENTATIONS["SurrealDBGraphStorage"]     = "lightrag.kg.surrealdb_impl.SurrealDBGraphStorage"
-STORAGE_IMPLEMENTATIONS["SurrealDBDocStatusStorage"] = "lightrag.kg.surrealdb_impl.SurrealDBDocStatusStorage"
+STORAGES["SurrealDBKVStorage"]        = ".kg.surrealdb_impl"
+STORAGES["SurrealDBVectorStorage"]    = ".kg.surrealdb_impl"
+STORAGES["SurrealDBGraphStorage"]     = ".kg.surrealdb_impl"
+STORAGES["SurrealDBDocStatusStorage"] = ".kg.surrealdb_impl"
+# plus matching entries in STORAGE_IMPLEMENTATIONS[<role>]["implementations"]
 ```
 
 ### 1.1 File Structure
 
+The adapter and its supporting files live at the **repo root** (not inside the installed `lightrag/` package); `patch_lightrag.py` copies the adapter into the package at setup time:
+
 ```
-lightrag/
-  kg/
-    surrealdb_impl.py           # All four storage class implementations
-    __init__.py                 # Register SurrealDB classes in STORAGE_IMPLEMENTATIONS
-  base.py                       # Abstract interfaces (read-only reference)
-examples/
-  lightrag_surrealdb_demo.py    # Integration smoke test
-.env.surrealdb.example          # Environment variable template
+surrealdb_impl.py               # All four storage class implementations
+patch_lightrag.py               # One-time setup: copy adapter into lightrag/kg/ + patch kg/__init__.py
+ingest.py                       # Ingestion pipeline
+api.py                          # FastAPI bridge
+docID.py                        # stable_doc_id() helper
+docling_to_content_list.py      # Future: RAG-Anything content_list converter (scaffold — see §1.4)
+surreal.exe / setup.ps1         # Windows-native setup helpers
+lightrag_data/graphrag.db       # Embedded SurrealKV database file (SURREALDB_PATH)
 ```
+
+### 1.4 Future: RAG-Anything Integration (`docling_to_content_list.py`)
+
+> **Status: FUTURE — scaffold only, not wired into the pipeline (as of 2026-07-03).**
+
+`docling_to_content_list.py` is a scaffold for integrating this assistant with [RAG-Anything](https://github.com/HKUDS/RAG-Anything) (HKUDS). It converts docling output into RAG-Anything's `insert_content_list` schema (`text` / `image` / `table` / `equation` items with `page_idx`), which is a superset of the current prose-only pipeline — it would additionally capture tables, figures (extracted to image files), and math equations (retained as LaTeX rather than stripped). Its `_looks_like_code()` / formula-handling TODOs are placeholders for the existing content-type rules (FR-I-03, FR-I-04). It will be completed when the assistant is ported onto RAG-Anything's ingestion layer.
 
 ### 1.2 Environment Variables
 
+The adapter uses an **embedded** `surrealkv://` database — there is no URL, username, or password. Auth-related variables from the earlier networked draft (`SURREALDB_URL`, `SURREALDB_USERNAME`, `SURREALDB_PASSWORD`) are **not used**.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SURREALDB_URL` | `ws://localhost:8000/rpc` | WebSocket connection URL |
+| `SURREALDB_PATH` | `./lightrag_data/graphrag.db` | Path to the embedded SurrealKV database file (opened as `surrealkv://<path>`) |
 | `SURREALDB_NAMESPACE` | `lightrag` | SurrealDB namespace |
 | `SURREALDB_DATABASE` | `assistant` | SurrealDB database name |
-| `SURREALDB_USERNAME` | `root` | Auth username |
-| `SURREALDB_PASSWORD` | `root` | Auth password (change in production) |
 | `SURREALDB_VECTOR_DIM` | `384` | Embedding dimension — must match model |
-| `SURREALDB_HNSW_EF` | `64` | HNSW `ef_construction` parameter |
+| `SURREALDB_HNSW_EF` | `64` | HNSW `ef_construction` (EFC) parameter |
 | `SURREALDB_HNSW_M` | `16` | HNSW M parameter (connections per node) |
 
 ### 1.3 Full Implementation
+
+> ⚠️ **The listing below is the ORIGINAL networked design and does not match the shipped code.** The authoritative implementation is [`surrealdb_impl.py`](surrealdb_impl.py) at the repo root. Read the code as the source of truth; the block below is retained only to show the original design intent. Key differences in the shipped adapter:
+>
+> - **Embedded, not networked:** `AsyncSurreal("surrealkv://<path>")` + `use(ns, db)` — **no** `Surreal(url)`, `connect()` over WebSocket, or `signin()`.
+> - **Connection singleton:** a module-level `_CONNECTION` + `async get_connection()` / `close_connection()`, not a `config`-dict-carried `_get_connection(config)`. The storage dataclasses have **no** `config` field.
+> - **Query serialization:** all queries run under an `asyncio.Lock` (`_query_lock`) to avoid embedded write-write conflicts; the SDK returns results already unwrapped, and a plain-string result is treated as an error and raised.
+> - **RecordID handling:** IDs come back as `RecordID` objects; rows are normalized with `record::id(id)` and `_normalise_row()`.
+> - **Signatures:** `filter_keys(set[str]) -> set[str]` (not `dict`); `drop() -> dict` status (not `None`); `SurrealDBVectorStorage.query(query: str, top_k, ...)` takes **raw text** and computes the embedding internally, adds a `cosine_better_than_threshold` filter; `upsert()` is itself batch-capable (no separate `upsert_many()`).
+> - **Tables/fields:** `SCHEMALESS`/`FLEXIBLE`; prefixes `kv_`/`vec_`/`ent_`/`rel_`; entity fields `entity_name`/`entity_type`; `keywords` is `string`. Doc-status adds `content_hash`, `file_path`, `track_id`, `metadata`, `error_msg`, and seven query helpers (`get_docs_by_statuses`, `get_docs_by_track_id`, `get_docs_paginated`, `get_doc_by_file_path`/`_basename`/`_content_hash`, `get_all_status_counts`). Graph adds `get_all_labels`, `get_popular_labels`, `search_labels`, `remove_nodes`, `remove_edges`, and a BFS `get_knowledge_graph()`.
 
 ```python
 """
@@ -1036,14 +1088,17 @@ Orchestrates file discovery, parallel extraction, deduplication, and LightRAG in
 
 ```bash
 python ingest.py --config config.yaml
-python ingest.py --reset   # drop and rebuild all SurrealDB tables, check to confirm use case
+python ingest.py --reset   # delete the embedded SurrealKV DB, then rebuild from scratch
 ```
 
 Key design decisions baked in:
-- `multiprocessing.Pool` for CPU-bound extraction (bypasses the GIL)
+- `multiprocessing.Pool(processes=extraction_workers)` for CPU-bound extraction — worker count is **capped** (default 8) to avoid OOM, not `cpu_count()`
 - `asyncio.Semaphore` caps concurrent LightRAG inserts to avoid overwhelming Ollama
-- LightRAG's `DocStatusStorage` provides implicit checkpointing — re-running the pipeline skips documents already marked `done`
+- LightRAG's `DocStatusStorage` provides implicit checkpointing — re-running the pipeline skips documents already marked processed
 - Content type is inferred from directory name fragments (configurable via `content_type_rules`)
+- `--reset` deletes the embedded database file (via `reset_database()`); the storage classes recreate their schema on the next init. For an embedded file store this is the reliable equivalent of "drop and rebuild all tables."
+
+> ⚠️ **The embedded `ingest.py` listing below is stale — read [`ingest.py`](ingest.py) as the source of truth.** The shipped pipeline differs: it imports `patch_lightrag`; uses a capped `extraction_workers` pool with `pool.imap_unordered` and Rich progress bars; calls `initialize_pipeline_status()` in `init_lightrag()` (fixes a "pipeline already busy" wedge); wraps the run in `try/finally` with `rag.finalize_storages()` to flush SurrealKV; inserts via `rag.ainsert(chunk.text, file_paths=chunk.source_path)` (**not** `metadata=`/`doc_id=`, so per-chunk `content_type`/`has_code` are not forwarded); `make_ollama_func(host)` drops the `model` parameter (the model name is supplied to LightRAG via `llm_model_name=`, and `ollama_model_complete()` derives it from LightRAG's injected global config); and `--reset` now actually clears data (see above).
 
 ```python
 """
@@ -1436,7 +1491,7 @@ def make_embedding_func(model_name: str, vector_dim: int) -> EmbeddingFunc:
     return EmbeddingFunc(embedding_dim=vector_dim, max_token_size=512, func=_embed)
 
 
-def make_ollama_func(host: str, model: str): # Check to confirm use case
+def make_ollama_func(host: str, model: str):  # NOTE: shipped code takes (host) only
     """Build an Ollama LLM func compatible with LightRAG's llm_model_func interface."""
     async def _llm(prompt: str, **kwargs) -> str:
         return await ollama_model_complete(
@@ -1460,7 +1515,7 @@ async def init_lightrag(config: PipelineConfig) -> LightRAG:
         graph_storage="SurrealDBGraphStorage",
         doc_status_storage="SurrealDBDocStatusStorage",
     )
-    await rag.initialize_storages() # Confirm use case
+    await rag.initialize_storages()  # NOTE: shipped code also calls initialize_pipeline_status()
     logger.info("LightRAG initialised with SurrealDB backend")
     return rag
 
@@ -1568,6 +1623,8 @@ uvicorn api:app --host 0.0.0.0 --port 11435
 ```
 
 Set `QUERY_LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY=...` to route query-time generation through Claude Haiku instead of local Ollama. Ingestion-phase LLM calls (entity extraction, keyword inference) always use Ollama regardless of this setting.
+
+> **Note (FR-F-02):** the shipped `/api/chat` passes conversation history **into retrieval** via `QueryParam(mode=mode, conversation_history=history, history_turns=3)`, so follow-up turns condition graph/vector selection — not only the final generation prompt. The embedded listing below shows the earlier `aquery(query, param=QueryParam(mode=mode))` form and is otherwise faithful to `api.py`.
 
 ```python
 """
@@ -1928,11 +1985,13 @@ async def graph_data() -> dict[str, Any]:
 
 ---
 
-## 4. Testing Strategy // Modify
+## 4. Testing Strategy
+
+> **Status: DEFERRED — not yet implemented (as of 2026-07-03).** No test files, no `pytest`/`pytest-asyncio`/`pytest-cov` dependencies, and no test fixtures exist in the repo. The strategy below is retained as the target design to implement when testing is prioritized. Since the storage backend is the embedded SurrealKV engine (no server), tests should point `SURREALDB_PATH` at a temporary file per test session and mock Ollama — there is no database container to manage.
 
 ### 4.1 Unit Tests — Adapter
 
-Each storage class is tested in isolation against a local SurrealDB instance (started via Docker). Tests cover:
+Each storage class is tested in isolation against an embedded SurrealKV database pointed at a temporary file (`SURREALDB_PATH`). Tests cover:
 
 - Connection and schema initialization
 - Round-trip upsert and retrieval for KV storage
@@ -1960,7 +2019,7 @@ Each storage class is tested in isolation against a local SurrealDB instance (st
 | Component | Tool | Notes |
 |-----------|------|-------|
 | Unit tests | `pytest` + `pytest-asyncio` | Async test support required throughout |
-| SurrealDB (test) | Docker (`surrealdb/surrealdb`) | Isolated per test session via fixtures |
+| SurrealDB (test) | Embedded SurrealKV (`surrealkv://` temp file) | Isolated per test session via fixtures; no server/container |
 | Ollama (test) | Mock via `httpx` MockTransport | Avoid real GPU calls in unit tests |
 | Coverage | `pytest-cov` | Target: >80% on `surrealdb_impl.py` |
 
@@ -1971,11 +2030,11 @@ Each storage class is tested in isolation against a local SurrealDB instance (st
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
 | LightRAG storage interface changes in a minor version update | Medium | High | Pin LightRAG version in `requirements.txt`; review CHANGELOG before upgrading |
-| SurrealDB HNSW query syntax differs from expected in surrealdb v2.x | Medium | High | Validate ANN query pattern against SurrealDB v2.5 docs before implementation; use integration test suite |
+| SurrealDB HNSW query syntax differs from expected | Medium | High | **Realized & mitigated.** With the pinned surrealdb `1.0.8` SDK, the ANN pattern is `embedding <|k,ef|> $vec` plus `vector::similarity::cosine(...)`; encoded directly in `SurrealDBVectorStorage.query()` with inline comments |
 | Qwen2.5:14B entity extraction quality insufficient for technical content | Low | Medium | Evaluate on 50-document sample before full ingestion; fallback to Claude Haiku for `EXTRACT` role |
 | docling formula extraction from math PDFs produces garbled text | High | Low | Math books use prose-only extraction (known limitation); formulas are excluded by design |
 | SurrealDB HNSW performance insufficient for corpus size | Low | Medium | Tune `EFC` and `M` parameters; corpus is personal-scale and unlikely to stress HNSW |
-| LightRAG does not officially merge SurrealDB adapter | High | Low | Maintain as a local fork/patch; adapter is a standalone file with no LightRAG core changes required |
+| LightRAG does not officially merge SurrealDB adapter | High | Low | **Realized & mitigated.** Adapter is maintained as a standalone `surrealdb_impl.py`; the idempotent `patch_lightrag.py` setup script copies it into the installed `lightrag/kg/` package and patches `kg/__init__.py`. Must be re-run after any `lightrag-hku` reinstall/upgrade |
 
 ---
 

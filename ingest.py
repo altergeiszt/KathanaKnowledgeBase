@@ -25,6 +25,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from multiprocessing import Pool
@@ -492,10 +493,31 @@ async def insert_with_semaphore(
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
+def reset_database(config: PipelineConfig) -> None:
+    """
+    Delete the embedded SurrealKV database so the next init rebuilds it from
+    scratch. For an embedded file-based store this is the reliable equivalent
+    of "drop and rebuild all tables" — it clears every namespace/table in one
+    step, and the storage classes recreate their schema via
+    `DEFINE TABLE IF NOT EXISTS ...` on the next `initialize()`.
+
+    Must run BEFORE init_lightrag() connects, since connecting opens the file.
+    """
+    db_path = Path(os.getenv("SURREALDB_PATH", str(config.working_dir / "graphrag.db")))
+    if db_path.exists():
+        if db_path.is_dir():
+            shutil.rmtree(db_path)
+        else:
+            db_path.unlink()
+        logger.warning(f"--reset: removed embedded database at {db_path}")
+    else:
+        logger.info(f"--reset: no existing database found at {db_path}")
+
+
 async def run_pipeline(config: PipelineConfig, reset: bool = False) -> None:
-    # Stage 0: (Optional) reset existing data
+    # Stage 0: (Optional) reset existing data — must happen before we connect
     if reset:
-        logger.warning("--reset flag set: existing SurrealDB data will be cleared on init")
+        reset_database(config)
 
     # Stage 1: Initialise LightRAG + SurrealDB
     rag = await init_lightrag(config)

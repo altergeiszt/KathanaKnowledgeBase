@@ -1,233 +1,240 @@
-# GraphRAG Assistant — Setup & Testing Guide
+# GraphRAG Assistant — Setup & Run Guide
+
+A personal GraphRAG assistant over your ebook library, built on LightRAG with an
+**embedded SurrealDB (SurrealKV) backend**. Everything runs locally — no Docker,
+no database server, no cloud services (except optional Claude API calls at query time).
+
+> **Storage model:** the assistant uses SurrealDB's embedded **SurrealKV** engine.
+> The database is a single local file (`lightrag_data/graphrag.db`) opened in-process
+> via `surrealkv://…`. There is **no SurrealDB server to run** and no `surreal.exe`
+> required — the `surrealdb` Python SDK provides the embedded engine.
+
+---
 
 ## Prerequisites
 
 | Tool | Purpose | Install |
 |------|---------|---------|
-| Docker Desktop | Runs SurrealDB, the API, and OpenWebUI | [docker.com](https://www.docker.com/products/docker-desktop) |
+| Python 3.11+ | Runs the pipeline and API | [python.org](https://www.python.org/downloads/) |
 | Ollama | Runs LLMs locally on your GPU | [ollama.com](https://ollama.com) |
-| `qwen2.5:14b` model | Entity extraction + query answering | `ollama pull qwen2.5:14b` |
+| `qwen2.5:14b` model | Entity extraction (+ optional query answering) | `ollama pull qwen2.5:14b` |
 
-> **GPU note:** Ollama runs on your host machine (not in Docker), so it has direct access to your RTX 4080 Super without any NVIDIA Container Toolkit setup.
+> **GPU note:** Ollama and `sentence-transformers` both use your RTX 4080 Super
+> directly on the host — no container GPU setup required.
 
 ---
 
 ## Project Layout
 
-Place all these files in one directory:
-
 ```
-graphrag-assistant/
-├── Dockerfile
-├── docker-compose.yml
+KathanaKnowledgeBase/
+├── surrealdb_impl.py      # Embedded SurrealDB (SurrealKV) storage adapter for LightRAG
+├── patch_lightrag.py      # One-time setup: registers the adapter into installed LightRAG
+├── ingest.py              # Ingestion pipeline (extract → dedup → index)
+├── api.py                 # FastAPI bridge (Ollama-compatible; OpenWebUI/GraphNotes connect here)
+├── docID.py               # stable_doc_id() helper
+├── docling_to_content_list.py  # Future: RAG-Anything converter (scaffold, unused)
+├── config.yaml            # Pipeline config
 ├── requirements.txt
-├── patch_lightrag.py
-├── surrealdb_impl.py
-├── ingest.py
-├── api.py
-├── config.yaml
-├── .env                ← copy from .env.example and edit
-└── .env.example
+├── setup.ps1              # Native Windows setup (venv + deps + patch + .env)
+├── .env                   # copy from .env.example and edit
+├── .env.example
+└── lightrag_data/
+    └── graphrag.db        # Embedded SurrealKV database (created on first run)
 ```
+
+---
+
+## Quick start (Windows / PowerShell)
+
+The one-shot setup script creates the virtualenv, installs dependencies, patches
+LightRAG, and creates your `.env`:
+
+```powershell
+pwsh ./setup.ps1
+```
+
+Then edit `.env` and set your library path (see Step 1 below), and skip to Step 3.
+
+If you prefer to do it manually, follow all steps below.
 
 ---
 
 ## Step 1 — Configure your environment
 
-```bash
-cp .env.example .env
+```powershell
+Copy-Item .env.example .env
 ```
 
-Open `.env` and set exactly one value:
+Open `.env` and set the one required value:
 
 ```env
-LIBRARY_PATH=/absolute/path/to/your/ebooks
+LIBRARY_PATH=C:\absolute\path\to\your\ebooks
 ```
 
-Everything else works as-is for a local Ollama + Docker setup. SurrealDB runs on host port `8001` to avoid clashing with the API on `8000`.
+Everything else works as-is for a local Ollama setup. To answer queries with
+Claude Haiku instead of local Ollama, set `QUERY_LLM_PROVIDER=anthropic` and
+`ANTHROPIC_API_KEY=…` (ingestion always uses Ollama regardless).
 
 ---
 
-## Step 2 — Pull the Ollama model
+## Step 2 — Install dependencies and patch LightRAG
 
-```bash
+If you did **not** run `setup.ps1`:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# One-time: copy the adapter into the installed LightRAG package and register it.
+# Re-run this after any reinstall/upgrade of lightrag-hku.
+.venv\Scripts\python.exe patch_lightrag.py
+```
+
+You'll see patch output like:
+
+```
+=== Patching lightrag-hku for SurrealDB adapter ===
+  Copied surrealdb_impl.py → .../lightrag/kg/surrealdb_impl.py
+  STORAGES: added SurrealDBKVStorage
+  ...
+  Verification passed — all classes registered correctly
+=== Done ===
+```
+
+---
+
+## Step 3 — Pull the Ollama model
+
+```powershell
 ollama pull qwen2.5:14b
 ```
 
-This downloads ~8 GB. Make sure Ollama is running (`ollama serve` if not already started as a service).
+This downloads ~8 GB. Make sure Ollama is running (`ollama serve` if it isn't
+already running as a service).
 
 ---
 
-## Step 3 — Build the Docker image
+## Step 4 — Run ingestion
 
-```bash
-docker compose build
+Ingestion is a one-shot job: it extracts, deduplicates, indexes, then exits.
+The embedded database file is created automatically on first run.
+
+```powershell
+.venv\Scripts\python.exe ingest.py --config config.yaml
 ```
 
-This installs all Python dependencies and runs `patch_lightrag.py` to copy `surrealdb_impl.py` into LightRAG and register the four storage classes. You'll see patch output in the build log:
+You'll see progress like:
 
 ```
-=== Patching lightrag-hku to register SurrealDB adapter ===
-  Copied surrealdb_impl.py → .../lightrag/kg/surrealdb_impl.py
-  Patched .../lightrag/kg/__init__.py
-    + STORAGE_IMPLEMENTATIONS["SurrealDBKVStorage"] = "..."
-    ...
-=== Patch complete ===
-```
-
----
-
-## Step 4 — Start SurrealDB and the API
-
-```bash
-docker compose up -d surrealdb api
-```
-
-Check both are healthy:
-
-```bash
-docker compose ps
-# surrealdb should show "healthy"
-# api should show "running"
-
-# Check the API is up
-curl http://localhost:8000/health
-# → {"status":"ok","provider":"ollama"}
-
-# Check query modes are visible
-curl http://localhost:8000/api/tags
-# → {"models":[{"name":"mix"}, ...]}
-```
-
----
-
-## Step 5 — Run ingestion
-
-Ingestion is a one-shot job, not a long-running service. It runs, indexes everything, then exits.
-
-```bash
-docker compose --profile ingest run --rm ingest
-```
-
-You'll see progress logs like:
-
-```
-INFO  Discovered 247 documents in /library
+INFO  Discovered 247 documents in ./library
 INFO  Extracting 247 documents using 8 workers...
 INFO  Extraction complete: 142,331 raw chunks
 INFO  Deduplication: 142,331 → 91,204 chunks (51,127 removed)
 INFO  Inserting 91,204 chunks (concurrency=4)...
 ```
 
-This will take a while — overnight is expected for a 14 GB library. If it's interrupted, re-run the same command. LightRAG's `DocStatusStorage` tracks which documents are done and skips them automatically.
+This will take a while — overnight is expected for a large library. If it's
+interrupted, just re-run the same command: `SurrealDBDocStatusStorage` tracks
+which documents are done and skips them automatically.
 
-**To re-index from scratch:**
-```bash
-docker compose --profile ingest run --rm ingest python ingest.py --reset
+**To re-index from scratch** (deletes the embedded database file, then rebuilds):
+
+```powershell
+.venv\Scripts\python.exe ingest.py --config config.yaml --reset
 ```
 
 ---
 
-## Step 6 — Start OpenWebUI
+## Step 5 — Start the API
 
-```bash
-docker compose up -d openwebui
+```powershell
+.venv\Scripts\uvicorn.exe api:app --host 0.0.0.0 --port 8000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+Verify it's up:
 
-1. Create an account (local only, no external signup)
-2. In the model picker, select one of: `mix`, `hybrid`, `local`, `global`, `naive`
-3. Ask a question about your library
+```powershell
+# Health
+curl http://localhost:8000/health
+# → {"status":"ok","provider":"ollama"}
+
+# Query modes (surfaced to OpenWebUI as selectable "models")
+curl http://localhost:8000/api/tags
+# → {"models":[{"name":"mix"}, ...]}
+```
+
+The API is Ollama-compatible. GraphNotes (or any Ollama client) can connect to
+`http://localhost:8000`.
+
+---
+
+## Step 6 — (Optional) OpenWebUI front-end
+
+Docker has been removed from this project, so run OpenWebUI however you prefer
+(e.g. `pip install open-webui` then `open-webui serve`, or the desktop app) and
+point it at this API:
+
+- Set OpenWebUI's Ollama base URL to `http://localhost:8000`
+- In the model picker, choose one of: `mix`, `hybrid`, `local`, `global`, `naive`
+- Ask a question about your library
 
 ---
 
 ## Troubleshooting
 
-### Patch failed / `STORAGE_IMPLEMENTATIONS` not found
+### Patch failed / storage classes not found
 
-LightRAG restructured in a newer version. Check what's in the installed `__init__.py`:
+LightRAG may have restructured in a newer version. Inspect the installed
+`__init__.py` and update `patch_lightrag.py`'s markers if needed:
 
-```bash
-docker compose run --rm api python -c "
-import importlib.util, pathlib
-spec = importlib.util.find_spec('lightrag')
-init = pathlib.Path(spec.origin).parent / 'kg' / '__init__.py'
-print(init.read_text()[:2000])
-"
+```powershell
+.venv\Scripts\python.exe -c "import importlib.util, pathlib; spec = importlib.util.find_spec('lightrag'); init = pathlib.Path(spec.origin).parent / 'kg' / '__init__.py'; print(init.read_text()[:2000])"
 ```
 
-Look for the dict name and update `patch_lightrag.py` accordingly.
+Remember to re-run `patch_lightrag.py` after every `pip install`/upgrade of
+`lightrag-hku` — the patch modifies files inside the installed package.
 
-### SurrealDB SDK response unwrap fails
+### Inspect the embedded database
 
-The `SurrealDBDB.query()` method in `surrealdb_impl.py` unwraps SDK responses. If you see `KeyError: 'result'` or empty results where you expect data, print the raw SDK response to see its shape:
+The database is a local SurrealKV file. Query it in-process (stop the API/ingest
+first, since the embedded engine is single-writer):
 
-```bash
-docker compose run --rm api python -c "
-import asyncio
-from surrealdb import Surreal
-
+```powershell
+.venv\Scripts\python.exe -c "import asyncio; from surrealdb import AsyncSurreal; import os
 async def check():
-    db = Surreal('ws://surrealdb:8000/rpc')
-    await db.connect()
-    await db.signin({'user': 'root', 'pass': 'root'})
-    await db.use('lightrag', 'assistant')
-    raw = await db.query('SELECT 1 AS test')
-    print(type(raw), raw)
-
-asyncio.run(check())
-"
-```
-
-Adjust the unwrap logic in `SurrealDBDB.query()` to match the actual structure.
-
-### Ollama not reachable from container
-
-`host.docker.internal` resolves to your host machine on Docker Desktop (Windows/Mac). On Linux it may not be set automatically. Add this to the `api` and `ingest` services in `docker-compose.yml`:
-
-```yaml
-extra_hosts:
-  - "host.docker.internal:host-gateway"
+    db = AsyncSurreal('surrealkv://./lightrag_data/graphrag.db')
+    await db.connect(); await db.use('lightrag', 'assistant')
+    print(await db.query('SELECT count() AS n FROM doc_status_default GROUP ALL'))
+    await db.close()
+asyncio.run(check())"
 ```
 
 ### Check ingestion status
 
-```bash
-docker compose run --rm api python -c "
-import asyncio
-from surrealdb_impl import SurrealDBDocStatusStorage
-
+```powershell
+.venv\Scripts\python.exe -c "import asyncio; from surrealdb_impl import SurrealDBDocStatusStorage
 async def check():
-    storage = SurrealDBDocStatusStorage()
-    storage.namespace = 'default'
-    await storage.initialize()
-    counts = await storage.get_status_counts()
-    print(counts)
+    s = SurrealDBDocStatusStorage(); s.namespace = 'default'
+    await s.initialize(); print(await s.get_status_counts())
+asyncio.run(check())"
+```
 
-asyncio.run(check())
-"
+### Ollama not reachable
+
+Confirm Ollama is running and the model is pulled:
+
+```powershell
+curl http://localhost:11434/api/tags
+ollama list
 ```
 
 ---
 
-## Useful commands
+## Useful notes
 
-```bash
-# View API logs
-docker compose logs -f api
-
-# View SurrealDB logs
-docker compose logs -f surrealdb
-
-# Open SurrealDB query console (runs surreal sql in the container)
-docker compose exec surrealdb surreal sql \
-  --conn ws://localhost:8000 --user root --pass root \
-  --ns lightrag --db assistant
-
-# Stop everything
-docker compose down
-
-# Stop and delete all data volumes (full reset)
-docker compose down -v
-```
+- **Reset everything:** delete `lightrag_data/graphrag.db` (or run ingestion with `--reset`).
+- **Change embedding model:** update `EMBEDDING_MODEL` and `SURREALDB_VECTOR_DIM` in `.env`
+  to match the model's output dimension, then re-ingest with `--reset` (vectors must be rebuilt).
+- **Query-time LLM:** `QUERY_LLM_PROVIDER=ollama` (fully local) or `anthropic` (Claude Haiku via API).

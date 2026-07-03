@@ -12,6 +12,11 @@ vector_dim:      384
 max_concurrent_inserts: 4
 chunk_max_chars:        1500
 
+# CPU-bound extraction worker pool size. Capped well below cpu_count() because
+# each worker runs a full docling+EasyOCR pipeline that can need several GB for
+# large PDFs; too many workers risks OOM. Override with EXTRACTION_WORKERS.
+extraction_workers: 8
+
 dedup_threshold: 0.85
 dedup_num_perm:  128
 dedup_shingle_k: 5

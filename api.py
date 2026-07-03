@@ -268,11 +268,18 @@ async def chat(request: ChatRequest) -> StreamingResponse:
     logger.info(f"[chat] mode={mode} query={query[:80]!r}")
 
     async def _stream() -> AsyncGenerator[bytes, None]:
-        # 1. Retrieve context from LightRAG (graph + vector retrieval)
+        # 1. Retrieve context from LightRAG (graph + vector retrieval).
+        #    Conversation history is passed into retrieval (not just the final
+        #    prompt) so follow-up turns resolve pronouns/ellipsis against prior
+        #    context when selecting graph nodes and vector chunks (FR-F-02).
         try:
             context: str = await rag.aquery(
                 query,
-                param=QueryParam(mode=mode),
+                param=QueryParam(
+                    mode=mode,
+                    conversation_history=history,
+                    history_turns=3,
+                ),
             )
         except Exception as exc:
             logger.error(f"LightRAG retrieval error: {exc}")

@@ -1,15 +1,17 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Native setup for GraphRAG Knowledge Base Assistant (no Docker required).
+    Native setup for the GraphRAG Knowledge Base Assistant (no Docker, no DB server).
 
 .DESCRIPTION
-    1. Downloads the SurrealDB v2.1.4 binary for Windows
-    2. Creates a Python virtual environment and installs all dependencies
-    3. Patches LightRAG to register the SurrealDB storage adapter
-    4. Creates .env from .env.example if one does not already exist
-    5. Updates config.yaml with native (non-container) paths
-    6. Prints the commands needed to start SurrealDB and the API
+    The assistant uses SurrealDB's embedded SurrealKV engine — the database is a
+    local file opened in-process, so there is no server to install or run.
+
+    1. Creates a Python virtual environment and installs all dependencies
+    2. Patches LightRAG to register the SurrealDB storage adapter
+    3. Creates .env from .env.example if one does not already exist
+    4. Updates config.yaml with native paths
+    5. Prints the commands needed to ingest and start the API
 
 .NOTES
     Run from the project root directory.
@@ -21,11 +23,7 @@ $ErrorActionPreference = "Stop"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-$SURREALDB_VERSION = "2.1.4"
-$SURREALDB_EXE     = "surreal.exe"
-$SURREALDB_URL     = "https://github.com/surrealdb/surrealdb/releases/download/v$SURREALDB_VERSION/surreal-v$SURREALDB_VERSION.windows-amd64.exe"
 $VENV_DIR          = ".venv"
-$DATA_DIR          = "surrealdb_data"
 $LIGHTRAG_DATA_DIR = "lightrag_data"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -37,8 +35,8 @@ function Fail       { param([string]$Text) Write-Host "`nERROR: $Text" -Foregrou
 
 # ── 0. Preflight ──────────────────────────────────────────────────────────────
 
-Write-Host "`nGraphRAG Assistant — Native Setup" -ForegroundColor White
-Write-Host   "==================================`n" -ForegroundColor White
+Write-Host "`nGraphRAG Assistant — Native Setup (embedded SurrealKV)" -ForegroundColor White
+Write-Host   "=====================================================`n" -ForegroundColor White
 
 Write-Step "Checking prerequisites"
 
@@ -63,51 +61,18 @@ foreach ($candidate in @("python", "python3", "py")) {
 }
 if (-not $python) { Fail "Python 3.11+ not found on PATH. Install from https://www.python.org/downloads/" }
 
-# ── 1. Download SurrealDB ─────────────────────────────────────────────────────
+# ── 1. Create data directory ──────────────────────────────────────────────────
 
-Write-Step "SurrealDB binary (v$SURREALDB_VERSION)"
+Write-Step "Creating data directory"
 
-if (Test-Path $SURREALDB_EXE) {
-    Write-Warn "$SURREALDB_EXE already exists — skipping download."
+if (-not (Test-Path $LIGHTRAG_DATA_DIR)) {
+    New-Item -ItemType Directory -Path $LIGHTRAG_DATA_DIR | Out-Null
+    Write-OK "Created $LIGHTRAG_DATA_DIR\  (embedded database file lives here)"
 } else {
-    Write-Host "    Downloading from GitHub releases..." -NoNewline
-    try {
-        # Use HttpClient for better progress and reliability than Invoke-WebRequest
-        Add-Type -AssemblyName System.Net.Http
-        $handler  = [System.Net.Http.HttpClientHandler]::new()
-        $handler.AllowAutoRedirect = $true
-        $client   = [System.Net.Http.HttpClient]::new($handler)
-        $client.Timeout = [TimeSpan]::FromMinutes(5)
-
-        $response = $client.GetAsync($SURREALDB_URL).GetAwaiter().GetResult()
-        if (-not $response.IsSuccessStatusCode) {
-            $client.Dispose()
-            Fail "Download failed: HTTP $([int]$response.StatusCode). Check the URL or download manually:`n    $SURREALDB_URL"
-        }
-        $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-        [System.IO.File]::WriteAllBytes((Join-Path $PWD $SURREALDB_EXE), $bytes)
-        $client.Dispose()
-        Write-Host " done" -ForegroundColor Green
-        Write-OK "Saved as $SURREALDB_EXE ($([math]::Round($bytes.Length / 1MB, 1)) MB)"
-    } catch {
-        Fail "Download error: $_`n`n    You can download manually from:`n    $SURREALDB_URL`n    and place it in this directory as surreal.exe"
-    }
+    Write-Warn "$LIGHTRAG_DATA_DIR\ already exists — skipping."
 }
 
-# ── 2. Create data directories ────────────────────────────────────────────────
-
-Write-Step "Creating data directories"
-
-foreach ($dir in @($DATA_DIR, $LIGHTRAG_DATA_DIR)) {
-    if (-not (Test-Path $dir)) {
-        New-Item -ItemType Directory -Path $dir | Out-Null
-        Write-OK "Created $dir\"
-    } else {
-        Write-Warn "$dir\ already exists — skipping."
-    }
-}
-
-# ── 3. Python virtual environment ─────────────────────────────────────────────
+# ── 2. Python virtual environment ─────────────────────────────────────────────
 
 Write-Step "Python virtual environment"
 
@@ -119,7 +84,7 @@ if (Test-Path "$VENV_DIR\Scripts\python.exe") {
     Write-OK "Virtual environment created."
 }
 
-$pip    = "$VENV_DIR\Scripts\pip.exe"
+$pip     = "$VENV_DIR\Scripts\pip.exe"
 $vPython = "$VENV_DIR\Scripts\python.exe"
 
 Write-Host "    Installing dependencies from requirements.txt (this may take a few minutes)..."
@@ -128,14 +93,14 @@ Write-Host "    Installing dependencies from requirements.txt (this may take a f
 if ($LASTEXITCODE -ne 0) { Fail "pip install failed. Check requirements.txt and your network connection." }
 Write-OK "Dependencies installed."
 
-# ── 4. Patch LightRAG ─────────────────────────────────────────────────────────
+# ── 3. Patch LightRAG ─────────────────────────────────────────────────────────
 
 Write-Step "Patching LightRAG to register SurrealDB adapter"
 
 & $vPython patch_lightrag.py
 if ($LASTEXITCODE -ne 0) { Fail "patch_lightrag.py failed. See output above." }
 
-# ── 5. Environment file ───────────────────────────────────────────────────────
+# ── 4. Environment file ───────────────────────────────────────────────────────
 
 Write-Step "Environment configuration (.env)"
 
@@ -147,14 +112,13 @@ if (Test-Path ".env") {
     Write-Warn "Open .env and set LIBRARY_PATH to the absolute path of your ebook library."
 }
 
-# ── 6. Update config.yaml for native paths ────────────────────────────────────
+# ── 5. Update config.yaml for native paths ────────────────────────────────────
 
 Write-Step "Updating config.yaml for native paths"
 
 $configPath = "config.yaml"
 $config     = Get-Content $configPath -Raw
 
-# Replace container-specific paths with local equivalents
 $nativeLibrary = "./library"
 $nativeWorkDir = "./$LIGHTRAG_DATA_DIR"
 
@@ -171,9 +135,7 @@ if ($updated -ne $config) {
     Write-Warn "config.yaml already uses native paths — no changes made."
 }
 
-# ── 7. Done — print run instructions ─────────────────────────────────────────
-
-$dbPath = (Resolve-Path $DATA_DIR -ErrorAction SilentlyContinue)?.Path ?? "$PWD\$DATA_DIR"
+# ── 6. Done — print run instructions ─────────────────────────────────────────
 
 Write-Host @"
 
@@ -181,21 +143,23 @@ Write-Host @"
   Setup complete. Next steps:
 ==================================
 
+There is no database server to start — SurrealKV is embedded and the database
+file is created automatically under $LIGHTRAG_DATA_DIR\ on first run.
+
 1. Edit .env and set LIBRARY_PATH to your ebook folder:
      LIBRARY_PATH=C:\path\to\your\books
 
-2. Start SurrealDB in a terminal (keep it running):
+2. Make sure Ollama is running and the model is pulled:
+     ollama pull qwen2.5:14b
 
-     .\surreal.exe start --log info --user root --pass root --bind 0.0.0.0:8001 rocksdb://$DATA_DIR\graphrag.db
-
-3. Run ingestion (one-time, re-run safely if interrupted):
+3. Run ingestion (one-time; re-run safely if interrupted, or add --reset to rebuild):
 
      .venv\Scripts\python.exe ingest.py --config config.yaml
 
-4. Start the API (keep it running, connects to GraphNotes):
+4. Start the API (keep it running; GraphNotes / OpenWebUI connect here):
 
-     .venv\Scripts\uvicorn.exe api:app --host 0.0.0.0 --port 8000 --reload
+     .venv\Scripts\uvicorn.exe api:app --host 0.0.0.0 --port 8000
 
-   GraphNotes can then connect to: http://localhost:8000
+   Clients can then connect to: http://localhost:8000
 
 "@ -ForegroundColor White
