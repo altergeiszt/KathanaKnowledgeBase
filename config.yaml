@@ -2,7 +2,7 @@
 # Mounted into the ingest container at /app/config.yaml
 # All values here can be overridden by environment variables in .env
 
-library_path: ./library
+library_path: "D:\\IngestTest"
 working_dir:  ./lightrag_data
 
 embedding_model: all-MiniLM-L6-v2

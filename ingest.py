@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -66,6 +67,8 @@ from lightrag import LightRAG, QueryParam
 from lightrag.kg.shared_storage import initialize_pipeline_status
 from lightrag.llm.ollama import ollama_model_complete, ollama_embed
 from lightrag.utils import EmbeddingFunc
+
+from pipeline_profiler import Profiler
 
 load_dotenv(override=True)
 console = Console()
@@ -514,13 +517,19 @@ def reset_database(config: PipelineConfig) -> None:
         logger.info(f"--reset: no existing database found at {db_path}")
 
 
-async def run_pipeline(config: PipelineConfig, reset: bool = False) -> None:
+async def run_pipeline(config: PipelineConfig, reset: bool = False, profile: bool = False) -> None:
     # Stage 0: (Optional) reset existing data — must happen before we connect
     if reset:
         reset_database(config)
 
+    profiler = Profiler(out_dir=str(config.working_dir / "profile_results")) if profile else None
+
+    def stage(name: str, **meta):
+        return profiler.stage(name, **meta) if profiler else contextlib.nullcontext()
+
     # Stage 1: Initialise LightRAG + SurrealDB
-    rag = await init_lightrag(config)
+    with stage("init_lightrag"):
+        rag = await init_lightrag(config)
 
     try:
         # Stage 2: File discovery
@@ -536,34 +545,42 @@ async def run_pipeline(config: PipelineConfig, reset: bool = False) -> None:
         # producing a near-empty result set instead of a clean failure).
         logger.info(f"Extracting {len(files)} documents using {config.extraction_workers} workers...")
         all_chunks: list[Chunk] = []
-        with make_progress() as progress, Pool(processes=config.extraction_workers) as pool:
-            task = progress.add_task("Extracting documents", total=len(files))
-            for name, doc_chunks in pool.imap_unordered(extract_document, files):
-                all_chunks.extend(doc_chunks)
-                progress.update(task, description=f"Extracted {name}")
-                progress.advance(task)
+        with stage("extraction", n_files=len(files)):
+            with make_progress() as progress, Pool(processes=config.extraction_workers) as pool:
+                task = progress.add_task("Extracting documents", total=len(files))
+                for name, doc_chunks in pool.imap_unordered(extract_document, files):
+                    all_chunks.extend(doc_chunks)
+                    progress.update(task, description=f"Extracted {name}")
+                    progress.advance(task)
 
         logger.info(f"Extraction complete: {len(all_chunks)} raw chunks")
 
         # Stage 4: Deduplication
-        chunks = deduplicate(
-            all_chunks,
-            threshold=config.dedup_threshold,
-            num_perm=config.dedup_num_perm,
-            k=config.dedup_shingle_k,
-        )
+        with stage("deduplication", n_chunks=len(all_chunks)):
+            chunks = deduplicate(
+                all_chunks,
+                threshold=config.dedup_threshold,
+                num_perm=config.dedup_num_perm,
+                k=config.dedup_shingle_k,
+            )
 
         # Stage 5: Async insertion into LightRAG / SurrealDB
+        # NOTE: this single stage covers embedding + entity extraction + SurrealDB
+        # write together — LightRAG's ainsert() bundles all three into one opaque
+        # async call, so there's no hook point to time them individually.
         logger.info(f"Inserting {len(chunks)} chunks (concurrency={config.max_concurrent_inserts})...")
-        semaphore = asyncio.Semaphore(config.max_concurrent_inserts)
-        tasks = [insert_with_semaphore(rag, chunk, semaphore) for chunk in chunks]
-        with make_progress() as progress:
-            task = progress.add_task("Inserting chunks", total=len(tasks))
-            for coro in asyncio.as_completed(tasks):
-                await coro
-                progress.advance(task)
+        with stage("lightrag_insertion", n_chunks=len(chunks), concurrency=config.max_concurrent_inserts):
+            semaphore = asyncio.Semaphore(config.max_concurrent_inserts)
+            tasks = [insert_with_semaphore(rag, chunk, semaphore) for chunk in chunks]
+            with make_progress() as progress:
+                task = progress.add_task("Inserting chunks", total=len(tasks))
+                for coro in asyncio.as_completed(tasks):
+                    await coro
+                    progress.advance(task)
 
         logger.info("Ingestion pipeline complete.")
+        if profiler:
+            profiler.report()
     finally:
         # Embedded SurrealKV buffers writes — without this, data can be lost
         # if the process exits without an explicit flush/close.
@@ -578,10 +595,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="GraphRAG Assistant ingestion pipeline")
     parser.add_argument("--config", default=None, help="Path to config.yaml")
     parser.add_argument("--reset", action="store_true", help="Drop and rebuild SurrealDB tables")
+    parser.add_argument("--profile", action="store_true", help="Profile stage timing/GPU usage (writes to <working_dir>/profile_results)")
     args = parser.parse_args()
 
     config = load_config(args.config)
-    asyncio.run(run_pipeline(config, reset=args.reset))
+    asyncio.run(run_pipeline(config, reset=args.reset, profile=args.profile))
 
 
 if __name__ == "__main__":

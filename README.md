@@ -182,6 +182,49 @@ point it at this API:
 
 ---
 
+## Inspecting the database (Surrealist)
+
+The database is the embedded **SurrealKV** store at `lightrag_data\graphrag.db`.
+Note this is a **directory**, not a single file (it contains `clog\` and `manifest\`),
+and there is no server running by default — so you **cannot** open it directly from
+Surrealist's *Import* dialog. Surrealist connects to a running SurrealDB *server*.
+
+To browse the embedded data in Surrealist, temporarily serve that same store:
+
+1. **Stop `ingest.py` and the API first.** SurrealKV is single-writer — the server
+   cannot open the store while the pipeline holds it (and vice versa).
+
+2. **Get a `surreal` server binary** (SurrealDB v2.x): download the
+   `surreal-*.windows-amd64.exe` from [SurrealDB releases](https://github.com/surrealdb/surrealdb/releases),
+   or `winget install SurrealDB.SurrealDB`.
+
+3. **Serve the existing store** from the project root. The engine must be `surrealkv`
+   (matching how the data was written — not `rocksdb`):
+
+   ```powershell
+   .\surreal.exe start --user root --pass root surrealkv://lightrag_data/graphrag.db
+   ```
+
+   This binds to `127.0.0.1:8000` by default.
+
+4. **Create a connection in Surrealist:**
+   - Address: `ws://localhost:8000` (auth: root / root)
+   - Namespace: `lightrag`   ·   Database: `assistant`  *(the `SURREALDB_NAMESPACE` / `SURREALDB_DATABASE` defaults)*
+
+5. Run `INFO FOR DB;` to list tables. They are prefixed `kv_`, `vec_`, `ent_`, `rel_`,
+   and `doc_status_`.
+
+> **Version caveat:** the on-disk format is written by the `surrealdb==1.0.8` Python SDK's
+> embedded engine. A version-mismatched `surreal` server may refuse to open the store; if
+> it errors on open, match the server to the SDK's core version (a recent 2.x is the best
+> first guess).
+
+For a quick peek without running a server, use the Python snippet in
+[Troubleshooting → Inspect the embedded database](#inspect-the-embedded-database) below,
+which reads the store in-process with the same engine the app uses.
+
+---
+
 ## Troubleshooting
 
 ### Patch failed / storage classes not found
