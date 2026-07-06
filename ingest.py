@@ -23,12 +23,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
 import shutil
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Any
@@ -114,6 +115,14 @@ class PipelineConfig:
     working_dir: Path
     extraction_workers: int = 8
     max_concurrent_inserts: int = 4
+    # Per-chunk insertion timeout (seconds). Guards against a single chunk whose
+    # Ollama entity-extraction "gleaning" loop runs away and wedges the whole run
+    # (the DB write path is already serialized by the adapter's _query_lock, so a
+    # straggler is far more likely to be a slow LLM step than DB contention).
+    # A chunk that exceeds this is logged with its source path and skipped; re-run
+    # with --from-checkpoint afterwards to re-attempt any that were skipped.
+    # 0 disables the timeout.
+    insert_timeout: int = 300
     dedup_threshold: float = 0.85
     dedup_num_perm: int = 128
     dedup_shingle_k: int = 5
@@ -141,6 +150,7 @@ def load_config(path: str | None) -> PipelineConfig:
         "working_dir":  os.getenv("LIGHTRAG_WORKING_DIR", "./lightrag_data"),
         "extraction_workers": int(os.getenv("EXTRACTION_WORKERS", "8")),
         "max_concurrent_inserts": int(os.getenv("MAX_CONCURRENT_INSERTS", "4")),
+        "insert_timeout": int(os.getenv("INSERT_TIMEOUT", "300")),
         "embedding_model": os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
         "ollama_host":  os.getenv("OLLAMA_HOST",  "http://localhost:11434"),
         "ollama_model": os.getenv("OLLAMA_MODEL", "qwen2.5:14b"),
@@ -155,6 +165,7 @@ def load_config(path: str | None) -> PipelineConfig:
         working_dir=Path(defaults["working_dir"]),
         extraction_workers=defaults["extraction_workers"],
         max_concurrent_inserts=defaults["max_concurrent_inserts"],
+        insert_timeout=defaults["insert_timeout"],
         embedding_model=defaults["embedding_model"],
         ollama_host=defaults["ollama_host"],
         ollama_model=defaults["ollama_model"],
@@ -401,6 +412,34 @@ def deduplicate(chunks: list[Chunk], threshold: float = 0.85, num_perm: int = 12
     logger.info(f"Deduplication: {len(chunks)} → {len(kept)} chunks ({removed} removed)")
     return kept
 
+# ---------------------------------------------------------------------------
+# Chunk checkpointing (post-dedup, pre-insertion)
+# ---------------------------------------------------------------------------
+
+def checkpoint_path(config: PipelineConfig) -> Path:
+    return config.working_dir / "chunks_checkpoint.json"
+
+
+def save_chunks_checkpoint(chunks: list[Chunk], config: PipelineConfig) -> None:
+    """Persist the post-dedup chunk list to disk before insertion begins."""
+    path = checkpoint_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([asdict(c) for c in chunks], f)
+    logger.info(f"Checkpoint written: {len(chunks)} chunks -> {path}")
+
+
+def load_chunks_checkpoint(config: PipelineConfig) -> list[Chunk]:
+    """Load a previously saved chunk list, skipping extraction/dedup."""
+    path = checkpoint_path(config)
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    chunks = [Chunk(**c) for c in raw]
+    logger.info(f"Checkpoint loaded: {len(chunks)} chunks <- {path}")
+    return chunks
+
+
+
 
 # ---------------------------------------------------------------------------
 # LightRAG initialisation
@@ -416,9 +455,16 @@ def make_embedding_func(model_name: str, vector_dim: int) -> EmbeddingFunc:
     async def _embed(texts: list[str]) -> list[list[float]]:
         loop = asyncio.get_event_loop()
         # Run GPU inference in a thread pool to avoid blocking the event loop
+        # show_progress_bar=False: SentenceTransformer.encode() defaults to
+        # showing a tqdm bar whenever the logger is at INFO or below. Since
+        # this fires on every single embedding call (i.e. per chunk, at
+        # whatever concurrency the insertion semaphore allows), it was
+        # spamming a fresh "Batches" bar per call instead of updating one —
+        # tqdm's cursor control and Rich's Live display don't share a line.
+        # The outer "Inserting chunks" Rich bar already tracks real progress.
         embeddings = await loop.run_in_executor(
             None,
-            lambda: _model.encode(texts, convert_to_numpy=True).tolist()
+            lambda: _model.encode(texts, convert_to_numpy=True, show_progress_bar=False).tolist()
         )
         return embeddings
 
@@ -475,6 +521,9 @@ async def insert_with_semaphore(
     rag: LightRAG,
     chunk: Chunk,
     semaphore: asyncio.Semaphore,
+    progress: Progress | None = None,
+    task_id: Any = None,
+    timeout: float | None = None,
 ) -> None:
     """
     Insert a single chunk into LightRAG under the semaphore.
@@ -484,10 +533,40 @@ async def insert_with_semaphore(
     of content, which would silently drop every chunk after the first one
     for a given book. Content-hash IDs (the default when `ids` is omitted)
     keep each chunk independently tracked and idempotent across re-runs.
+
+    If a Rich progress + task_id are passed, the bar description is updated
+    to the source file *on semaphore acquire* (i.e. when this chunk actually
+    starts inserting, not when it finishes). This surfaces what's in flight:
+    with N concurrent inserts the description flickers among the N active
+    files (last-writer-wins), and when the run collapses to a single slow
+    straggler the description stabilises on that file's name — which is the
+    only way to see which chunk is hanging, since ainsert() itself is opaque.
+
+    `timeout` (seconds, None/0 = disabled) caps a single ainsert(). A chunk
+    that exceeds it — most likely a runaway Ollama gleaning loop, since the
+    adapter already serializes DB writes — is cancelled, logged with its
+    source path, and skipped so it can't wedge the whole run. Cancellation is
+    safe here: the adapter's _query_lock is released on CancelledError (it's
+    held only inside an `async with` around each individual query), and chunk
+    upserts are content-hash idempotent, so a --from-checkpoint re-run cleanly
+    re-attempts anything skipped. A skipped chunk is simply absent from the
+    graph until then, not half-written in a corrupt state.
     """
     async with semaphore:
+        if progress is not None and task_id is not None:
+            progress.update(task_id, description=f"Inserting {Path(chunk.source_path).name}")
         try:
-            await rag.ainsert(chunk.text, file_paths=chunk.source_path)
+            coro = rag.ainsert(chunk.text, file_paths=chunk.source_path)
+            if timeout:
+                await asyncio.wait_for(coro, timeout=timeout)
+            else:
+                await coro
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Insert TIMED OUT after {timeout}s for a chunk from "
+                f"{chunk.source_path} — skipped. Re-run with --from-checkpoint "
+                f"to re-attempt. (Likely a runaway LLM entity-extraction step.)"
+            )
         except Exception as exc:
             logger.error(f"Insert failed for chunk from {chunk.source_path}: {exc}")
 
@@ -517,7 +596,7 @@ def reset_database(config: PipelineConfig) -> None:
         logger.info(f"--reset: no existing database found at {db_path}")
 
 
-async def run_pipeline(config: PipelineConfig, reset: bool = False, profile: bool = False) -> None:
+async def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: bool = False, profile: bool = False) -> None:
     # Stage 0: (Optional) reset existing data — must happen before we connect
     if reset:
         reset_database(config)
@@ -528,52 +607,62 @@ async def run_pipeline(config: PipelineConfig, reset: bool = False, profile: boo
         return profiler.stage(name, **meta) if profiler else contextlib.nullcontext()
 
     # Stage 1: Initialise LightRAG + SurrealDB
-    with stage("init_lightrag"):
-        rag = await init_lightrag(config)
-
+    rag = await init_lightrag(config)
     try:
-        # Stage 2: File discovery
-        files = discover_files(config.library_path)
-        if not files:
-            logger.warning(f"No PDF/EPUB files found under {config.library_path}")
-            return
+        if from_checkpoint and checkpoint_path(config).exists():
+            chunks = load_chunks_checkpoint(config)
+        else:
+            if from_checkpoint:
+                logger.warning(f"--from-checkpoint set but no checkpoint found at {checkpoint_path(config)}; running full pipeline")
 
-        # Stage 3: Parallel extraction (CPU-bound → multiprocessing)
-        # NOTE: worker count is capped well below cpu_count() — each worker runs a full
-        # docling+EasyOCR pipeline that can need several GB for large PDFs, so a high
-        # process count risks OOM (workers silently drop documents via MemoryError,
-        # producing a near-empty result set instead of a clean failure).
-        logger.info(f"Extracting {len(files)} documents using {config.extraction_workers} workers...")
-        all_chunks: list[Chunk] = []
-        with stage("extraction", n_files=len(files)):
-            with make_progress() as progress, Pool(processes=config.extraction_workers) as pool:
-                task = progress.add_task("Extracting documents", total=len(files))
-                for name, doc_chunks in pool.imap_unordered(extract_document, files):
-                    all_chunks.extend(doc_chunks)
-                    progress.update(task, description=f"Extracted {name}")
-                    progress.advance(task)
+            files = discover_files(config.library_path)
+            if not files:
+                logger.warning(f"No PDF/EPUB files found under {config.library_path}")
+                return
 
-        logger.info(f"Extraction complete: {len(all_chunks)} raw chunks")
+            # Stage 3: Parallel extraction (CPU-bound → multiprocessing)
+            # NOTE: worker count is capped well below cpu_count() — each worker runs a full
+            # docling+EasyOCR pipeline that can need several GB for large PDFs, so a high
+            # process count risks OOM (workers silently drop documents via MemoryError,
+            # producing a near-empty result set instead of a clean failure).
+            logger.info(f"Extracting {len(files)} documents using {config.extraction_workers} workers...")
+            all_chunks: list[Chunk] = []
+            with stage("extraction", n_files=len(files)):
+                with make_progress() as progress, Pool(processes=config.extraction_workers) as pool:
+                    task = progress.add_task("Extracting documents", total=len(files))
+                    for name, doc_chunks in pool.imap_unordered(extract_document, files):
+                        all_chunks.extend(doc_chunks)
+                        progress.update(task, description=f"Extracted {name}")
+                        progress.advance(task)
 
-        # Stage 4: Deduplication
-        with stage("deduplication", n_chunks=len(all_chunks)):
-            chunks = deduplicate(
-                all_chunks,
-                threshold=config.dedup_threshold,
-                num_perm=config.dedup_num_perm,
-                k=config.dedup_shingle_k,
-            )
+            logger.info(f"Extraction complete: {len(all_chunks)} raw chunks")
 
-        # Stage 5: Async insertion into LightRAG / SurrealDB
+            # Stage 4: Deduplication
+            with stage("deduplication", n_chunks=len(all_chunks)):
+                chunks = deduplicate(
+                    all_chunks,
+                    threshold=config.dedup_threshold,
+                    num_perm=config.dedup_num_perm,
+                    k=config.dedup_shingle_k,
+                )
+
+            # Checkpoint: persist the post-dedup chunk list before insertion begins
+            save_chunks_checkpoint(chunks, config)
+
+        # Stage 5: Async insertion into LightRAG / SurrealDB — runs on BOTH the
+        # checkpoint-resume path and the fresh-run path, not just the latter.
         # NOTE: this single stage covers embedding + entity extraction + SurrealDB
         # write together — LightRAG's ainsert() bundles all three into one opaque
         # async call, so there's no hook point to time them individually.
         logger.info(f"Inserting {len(chunks)} chunks (concurrency={config.max_concurrent_inserts})...")
         with stage("lightrag_insertion", n_chunks=len(chunks), concurrency=config.max_concurrent_inserts):
             semaphore = asyncio.Semaphore(config.max_concurrent_inserts)
-            tasks = [insert_with_semaphore(rag, chunk, semaphore) for chunk in chunks]
             with make_progress() as progress:
-                task = progress.add_task("Inserting chunks", total=len(tasks))
+                task = progress.add_task("Inserting chunks", total=len(chunks))
+                tasks = [
+                    insert_with_semaphore(rag, chunk, semaphore, progress, task, config.insert_timeout)
+                    for chunk in chunks
+                ]
                 for coro in asyncio.as_completed(tasks):
                     await coro
                     progress.advance(task)
@@ -583,8 +672,12 @@ async def run_pipeline(config: PipelineConfig, reset: bool = False, profile: boo
             profiler.report()
     finally:
         # Embedded SurrealKV buffers writes — without this, data can be lost
-        # if the process exits without an explicit flush/close.
-        await rag.finalize_storages()
+        # if the process exits without an explicit flush/close. On a large
+        # graph this flush is not instant, so give it its own visible phase
+        # rather than letting the process sit silent after the bar hits 100%.
+        with make_progress() as progress:
+            progress.add_task("Flushing to SurrealDB (finalizing storages)", total=None)
+            await rag.finalize_storages()
 
 
 # ---------------------------------------------------------------------------
@@ -595,12 +688,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="GraphRAG Assistant ingestion pipeline")
     parser.add_argument("--config", default=None, help="Path to config.yaml")
     parser.add_argument("--reset", action="store_true", help="Drop and rebuild SurrealDB tables")
-    parser.add_argument("--profile", action="store_true", help="Profile stage timing/GPU usage (writes to <working_dir>/profile_results)")
+    parser.add_argument(
+        "--from-checkpoint",
+        action="store_true",
+        help="Skip discovery/extraction/dedup and reuse the last saved chunks_checkpoint.json",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
-    asyncio.run(run_pipeline(config, reset=args.reset, profile=args.profile))
-
+    asyncio.run(run_pipeline(config, reset=args.reset, from_checkpoint=args.from_checkpoint))
 
 if __name__ == "__main__":
     main()
