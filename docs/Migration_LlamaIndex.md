@@ -130,12 +130,17 @@ Why this shape:
 - **Clean churn.** Re-ingesting an edited note touches only note-namespaced
   `ref_doc_id`s, never the expensive book graph (critical for spaced-repetition updates).
 
-### Store choice
+### Store choice — decided: Neo4j (see §11)
 
-- Start: `SimplePropertyGraphStore` (JSON file, embedded, no server). Fine for the
-  current ~5k-node scale.
-- If the real corpus grows well past that: swap to **Kuzu** (embedded, on-disk, built
-  for scale) — same `PropertyGraphIndex` API, so it's a store swap, not a rewrite.
+Originally scoped as embedded (`SimplePropertyGraphStore` / Kuzu) before the scale
+finding in §10 and the maintenance discussion in §11 settled it on **Neo4j Community
+Edition, local via Neo4j Desktop**, connected through `Neo4jPropertyGraphStore` over
+Bolt. Trade accepted: a running local server instead of an embedded file — in
+exchange for active maintenance, first-class LlamaIndex + ecosystem support, and the
+Neo4j Browser for visually exploring note↔book relationships (the actual point of
+this project). Community Edition's single-active-database limit is a non-issue here:
+notes/books separation is via `source_type` labels and namespaced `ref_doc_id`s within
+one database (§3), not two physical databases.
 
 ---
 
@@ -208,11 +213,17 @@ nodes → insert into `PropertyGraphIndex`.
 ```python
 from llama_index.core import PropertyGraphIndex
 from llama_index.core.indices.property_graph import SimpleLLMPathExtractor
+from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 llm   = Ollama(model="qwen2.5:14b", request_timeout=300.0)
 embed = HuggingFaceEmbedding(model_name="all-MiniLM-L6-v2")  # keep current model
+
+graph_store = Neo4jPropertyGraphStore(
+    username="neo4j", password="<local password>",
+    url="bolt://localhost:7687",   # Neo4j Desktop, local
+)
 
 nodes = [n for c in load_checkpoint() for n in chunk_to_nodes(c)]
 
@@ -221,11 +232,14 @@ index = PropertyGraphIndex(
     llm=llm,
     embed_model=embed,
     kg_extractors=[SimpleLLMPathExtractor(llm=llm)],   # runs per chunk; you control it
-    property_graph_store=graph_store,   # Simple… or Kuzu
+    property_graph_store=graph_store,
     show_progress=True,
 )
-index.storage_context.persist(persist_dir="./pg_storage")
 ```
+
+Note: unlike the embedded-store sketch this replaces, Neo4j persists server-side —
+no `index.storage_context.persist(...)` step needed; writes land in the running
+Neo4j instance directly via Bolt.
 
 Notes vs LightRAG:
 
@@ -340,14 +354,138 @@ The notes-only / books-only / both A/B (§3) is a matter of filtering retrievers
 
 ---
 
-## 9. Suggested order of work
+---
 
-1. **Delete-verify harness (§7)** — gate. Prove note updates purge cleanly.
+## 10. Measured extraction cost (benchmark, qwen2.5:14b, RTX 4080 Super)
+
+Ran `extraction_benchmark.py` against a stratified 40-chunk sample of the real
+checkpoint. Results (serial, concurrency=1):
+
+| Condition | median s/chunk | notes |
+|---|---|---|
+| open-ended, single pass | 3.67s | baseline |
+| schema-constrained, single pass | 3.88s | **6% slower**, not faster — schema prompt produced *more* output tokens (245 vs 235 median), not fewer. Kills the "schema extraction is cheaper" argument for neo4j-graphrag. |
+| open-ended + gleaning (2nd pass) | 6.42s | **+75%** for +1 entity/+2 relations median. Not worth it at this scale — **use single-pass, no gleaning** as the default. |
+
+Full-corpus build time at ~3.9s/chunk, serial, full (non-hybrid) extraction:
+
+| Chunks | Time |
+|---|---|
+| 80k (conservative) | 3.6 days |
+| 300k (mid) | 13.5 days |
+| 1M (text-interpretation of "1.30 GB") | 44.9 days |
+
+**This is why full-corpus extraction is out and the hybrid design (embed everything,
+LLM-extract only notes + a curated book slice, §3) is load-bearing, not optional.**
+A curated slice of a few thousand chunks turns this into hours, re-runnable overnight.
+
+---
+
+## 11. Decision: LlamaIndex as framework, Neo4j as store
+
+**Correction from an earlier draft of this doc**, which briefly recorded
+"neo4j-graphrag owns ingestion end-to-end" — that was a mixup between two separate
+axes (which *framework* orchestrates ingestion, vs. which *engine* the hybrid split
+avoids full-corpus extraction on) and has been reverted. The actual decision:
+
+- **LlamaIndex** is the orchestration framework — `TextNode`s, `kg_extractors`,
+  `PropertyGraphIndex` (§4, §5). This is what preserves the docling/dedup front-half
+  and `chunks_checkpoint.json` seam (§0), and what makes the hybrid split (§3) a
+  natural per-node choice rather than something fought against a pipeline that wants
+  to own parsing-through-writing as one motion.
+- **Neo4j** (Community Edition, local via Desktop) is the storage engine underneath —
+  `Neo4jPropertyGraphStore` in place of the generic/embedded store referenced
+  elsewhere in this doc. Chosen for active maintenance, documentation quality, and
+  the Neo4j Browser visualization of note↔book relationships.
+- `neo4j-graphrag` (the first-party Neo4j library) was evaluated and set aside for
+  this project specifically because it wants to own parsing → chunking → extraction →
+  writing itself, which would mean giving up the custom front-half. Its
+  schema-constrained extraction was *not* faster on measured hardware either (§10),
+  removing the one technical argument that might have offset that cost. It remains a
+  reasonable individual-component option later (e.g. its entity-resolution or
+  Text2Cypher retriever against the same Neo4j instance), just not as the ingestion
+  owner.
+- Single-pass extraction, gleaning **off** (§10), regardless of framework.
+- Hybrid split (§3) stays as originally designed: embed every `TextNode`; run
+  `kg_extractors` only on notes + a curated book slice.
+
+Update §5's code sketch and §7's harness to target `Neo4jPropertyGraphStore`
+specifically (Bolt URI/auth) rather than a generic property-graph store.
+
+---
+
+## 12. Just in case: cloud GPU for the extraction batch (not a database migration)
+
+If even the curated hybrid slice is too slow locally, or extraction schema iteration
+needs to be faster than same-day, cloud GPU is the lever — but rent **GPU throughput**,
+not "compute-optimized" instances (those are CPU-heavy; useless for a GPU-bound
+token-generation bottleneck).
+
+### Instance choice
+
+AWS P-series, but not the naive "oldest = cheapest" read:
+
+| Family | GPU | Verdict |
+|---|---|---|
+| P2 | K80 (2014) | **Avoid.** Older/slower than the local 4080 Super for this workload — likely *worse* than running locally. Not a real option despite lowest sticker price. |
+| P3 | V100 | Reasonable floor — genuine generational upgrade over local hardware, decent price especially on Spot. |
+| **P4d** | A100 (40/80GB) | **Likely sweet spot.** Higher hourly on-demand rate than P3, but ~2.5x throughput — often cheaper *per chunk* despite higher $/hr. |
+| P5 | H100 | Overkill for 14B-class batch entity extraction; built for frontier training. |
+
+### Use Spot, not on-demand
+
+Spot = up to 90% off on-demand, in exchange for possible reclamation. This fits the
+job specifically: it's a non-time-sensitive batch, and the pipeline already
+checkpoints (`chunks_checkpoint.json`, plus LlamaIndex's own per-node insert tracking) —
+interruption just means resume from the last completed chunk, not restart. Spot is
+built for exactly this shape of job.
+
+**EC2 Capacity Blocks for ML** is a middle ground worth knowing about: reserve GPU
+capacity for a fixed short window (a day or two) at a set rate — no interruption risk,
+cheaper than full on-demand, good fit for "burn through a bounded batch once."
+
+### What NOT to do: don't run the database in the cloud
+
+The cloud box is a **stateless extraction worker**, not a database host. Avoid the
+"how do I migrate data off a cloud database" problem entirely by never putting one
+there:
+
+1. Cloud GPU instance runs Ollama/vLLM + the extraction pipeline against the curated
+   slice.
+2. It writes results to **files** (CSV/Parquet: entities, relations, embeddings) —
+   not into a live Neo4j.
+3. Download the files (small — extracted graph is far smaller than source corpus;
+   minutes, not a data-transfer project).
+4. Bulk-load locally via `neo4j-admin database import` / batched `LOAD CSV` into the
+   local Neo4j.
+
+Gotcha: pin the exact embedding model + version on both sides. A vector index is only
+coherent if every vector came from the same embedder — mixing a cloud-generated
+embedding with a locally-generated query embedding from a different model/version
+silently breaks retrieval. (Currently `all-MiniLM-L6-v2` — keep this pinned.)
+
+**Try local-hybrid first.** If the curated slice finishes locally in a tolerable
+window (e.g. under ~12h), cloud may not be needed at all for an MVP. Reach for cloud
+when even the curated build is too slow locally, or extraction-schema iteration speed
+matters enough that day-plus-per-run is intolerable.
+
+---
+
+## 13. Suggested order of work
+
+1. **Delete-verify harness (§7)** — gate. Prove note updates purge cleanly against
+   `Neo4jPropertyGraphStore` specifically (§11).
 2. Content-based classification fix (§2.1) — so `content_type` is trustworthy.
-3. Book Stage-5 swap (§5) — `TextNode`s + `PropertyGraphIndex`, delete SurrealDB path.
-4. Note ingester (§6) — structure-first, wikilinks as edges.
-5. Retrieval interface + notes/books A/B (§3, §8).
-6. Delete the LightRAG scaffolding once §3–§5 are green.
+3. Define the curated hybrid slice (§3, §11) — which books (or chapters) get full
+   `kg_extractors` treatment vs. embeddings-only.
+4. Book ingestion via `PropertyGraphIndex` + `kg_extractors` (§5, §11) over the
+   curated slice, single-pass, no gleaning (§10) — delete the LightRAG/SurrealDB
+   scaffolding once this is green.
+5. Note ingester (§6) — structure-first, wikilinks as edges, feeding the same Neo4j.
+6. Retrieval interface + notes/books A/B (§3, §8).
+7. **If needed** — cloud GPU batch per §12, only after confirming the local curated
+   build is genuinely too slow.
 
 Open knobs to test empirically: code-blocks-as-separate-nodes vs metadata (§4);
-unified vs namespaced retrieval (§3); `SimplePropertyGraphStore` vs Kuzu at scale (§3).
+unified vs namespaced retrieval (§3); size/composition of the curated slice (§3, §10);
+`SimplePropertyGraphStore`-equivalent local persistence vs scale needs.
