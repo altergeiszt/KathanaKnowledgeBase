@@ -674,15 +674,84 @@ async def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpo
         # Embedded SurrealKV buffers writes — without this, data can be lost
         # if the process exits without an explicit flush/close. On a large
         # graph this flush is not instant, so give it its own visible phase
-        # rather than letting the process sit silent after the bar hits 100%.
+        # AND an elapsed-time heartbeat.
+        #
+        # Why not rely on the spinner: Rich drives spinner animation from a
+        # background refresh thread on wall-clock time, so it keeps spinning
+        # even if finalize is wedged — it can't distinguish progress from a
+        # hang. The heartbeat below only logs while the event loop is actually
+        # being serviced, so:
+        #   - ticking heartbeat  → finalize is progressing / async-waiting
+        #   - frozen heartbeat   → the call is blocking the loop in native
+        #                          code (busy or deadlocked); attach with
+        #                          `py-spy dump --pid <PID>` from another
+        #                          terminal, or drop in
+        #                          faulthandler.dump_traceback_later(30, repeat=True)
+        #                          before this block, to see exactly where.
+        # shield() keeps the 5s poll timeout from cancelling the flush —
+        # cancelling finalize mid-write is exactly the data loss it prevents.
         with make_progress() as progress:
             progress.add_task("Flushing to SurrealDB (finalizing storages)", total=None)
-            await rag.finalize_storages()
+            finalize_task = asyncio.create_task(rag.finalize_storages())
+            waited = 0
+            while not finalize_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(finalize_task), timeout=5)
+                except asyncio.TimeoutError:
+                    waited += 5
+                    logger.info(f"finalize_storages() still running… {waited}s elapsed")
+            await finalize_task  # surface any exception raised by finalize
 
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
+
+def _shutdown_loop(loop: asyncio.AbstractEventLoop, timeout: float = 10.0) -> None:
+    """
+    Bounded replacement for the teardown asyncio.run() does after the main
+    coroutine finishes.
+
+    asyncio.run()'s built-in _cancel_all_tasks() cancels leftover tasks and then
+    waits on an UNBOUNDED `gather(*leftover, return_exceptions=True)`. If a
+    third-party async resource leaves a task parked on a native Windows IOCP read
+    — e.g. LightRAG's Ollama/httpx client, or LLM sub-tasks orphaned when a
+    runaway ainsert() is cancelled by the per-chunk insert_timeout — that gather
+    never returns, and the process hangs in `GetQueuedCompletionStatus` at the
+    "finalizing storages" line with all data already flushed.
+
+    This does the same cancel-and-drain but:
+      (a) logs the repr() of every leftover task first, so the actual leak can be
+          identified and closed properly (the real fix is usually an explicit
+          client .aclose() before shutdown), and
+      (b) waits only `timeout` seconds before abandoning any task that refuses to
+          cancel and forcing the loop shut. wait_for schedules a loop callback, so
+          on the proactor loop this is guaranteed to wake and return rather than
+          blocking in the completion port forever.
+    Abandoning leftovers is safe here: finalize_storages() already flushed
+    SurrealKV, so the orphaned tasks are just network connections we don't need.
+    """
+    pending = list(asyncio.all_tasks(loop))
+    if pending:
+        logger.warning(f"{len(pending)} task(s) still pending at shutdown; cancelling:")
+        for t in pending:
+            logger.warning(f"  leftover task: {t.get_coro()!r}")
+            t.cancel()
+        try:
+            loop.run_until_complete(
+                asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=timeout,
+                )
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Leftover task(s) did not cancel within {timeout}s — abandoning them "
+                "and forcing shutdown. Data was already flushed by finalize_storages(), "
+                "so this is safe; the repr(s) above identify what to close explicitly."
+            )
+    loop.run_until_complete(loop.shutdown_asyncgens())
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="GraphRAG Assistant ingestion pipeline")
@@ -693,10 +762,66 @@ def main() -> None:
         action="store_true",
         help="Skip discovery/extraction/dedup and reuse the last saved chunks_checkpoint.json",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable per-stage timing via pipeline_profiler (writes to working_dir/profile_results)",
+    )
+    parser.add_argument(
+        "--debug-finalize",
+        action="store_true",
+        help=(
+            "Diagnose end-of-run hangs. Arms faulthandler to dump every thread's "
+            "stack to finalize_traceback.log on a timer (default 30s, override with "
+            "DEBUG_FINALIZE_INTERVAL). The timer runs on a dedicated C thread, so it "
+            "fires even when the main thread is fully blocked — capturing a hang in "
+            "finalize_storages() OR in asyncio.run()'s _cancel_all_tasks teardown "
+            "(which a finalize-only probe would miss). Off by default; only pass it "
+            "when actively chasing a hang. Dumps go to a file, not the console, so "
+            "they don't disturb the Rich progress UI."
+        ),
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
-    asyncio.run(run_pipeline(config, reset=args.reset, from_checkpoint=args.from_checkpoint))
+
+    # --debug-finalize: arm faulthandler for the WHOLE asyncio.run(), not just the
+    # finalize block. The py-spy dump that motivated this flag showed the process
+    # parked in asyncio.run's _cancel_all_tasks teardown — i.e. *after* run_pipeline
+    # returned — so a probe scoped only to finalize_storages() would never see it.
+    # Wrapping the whole run covers finalize, the teardown sweep, and any insertion
+    # straggler too. Line-buffered file so the last dump survives a hard kill.
+    dump_fh = None
+    if args.debug_finalize:
+        import faulthandler
+        interval = int(os.getenv("DEBUG_FINALIZE_INTERVAL", "30"))
+        dump_fh = open("finalize_traceback.log", "w", buffering=1)
+        faulthandler.enable(file=dump_fh)
+        faulthandler.dump_traceback_later(interval, repeat=True, file=dump_fh)
+        logger.info(
+            f"--debug-finalize: dumping all thread stacks every {interval}s "
+            f"to finalize_traceback.log"
+        )
+
+    # Manage the loop manually instead of asyncio.run() so we control teardown:
+    # asyncio.run()'s built-in _cancel_all_tasks waits forever on leftover tasks,
+    # which is the observed hang. _shutdown_loop() bounds and logs that instead.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(run_pipeline(
+            config,
+            reset=args.reset,
+            from_checkpoint=args.from_checkpoint,
+            profile=args.profile,
+        ))
+    finally:
+        _shutdown_loop(loop)
+        if dump_fh is not None:
+            import faulthandler
+            faulthandler.cancel_dump_traceback_later()
+            dump_fh.close()
+        loop.close()
 
 if __name__ == "__main__":
     main()
