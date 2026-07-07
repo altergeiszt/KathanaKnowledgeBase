@@ -1,33 +1,37 @@
 """
 ingest.py
 
-GraphRAG Assistant — Document Ingestion Pipeline
+GraphRAG Assistant — Document Ingestion Pipeline (LlamaIndex + Neo4j)
 
 Orchestrates:
   1. File discovery
-  2. PDF/EPUB extraction (multiprocessing, CPU-bound)
+  2. PDF/EPUB extraction (multiprocessing, CPU-bound) — docling
   3. Deduplication (MinHash LSH)
-  4. LightRAG insertion — embedding + entity extraction + SurrealDB persistence (asyncio)
+  4. Node building + HYBRID insertion into a Neo4j PropertyGraphIndex:
+       - curated-slice books (classify.is_curated) → LLM entity extraction
+       - everything else                          → embeddings-only
+     Full-corpus LLM extraction is infeasible (~3.9s/chunk → days; §10 of
+     Migration_LlamaIndex.md), so only a hand-picked curated slice gets
+     kg_extractors while every chunk is still embedded and vector-searchable (§3).
 
 Usage:
-    python ingest.py [--config config.yaml] [--reset]
+    python ingest.py [--config config.yaml] [--reset] [--from-checkpoint] [--profile]
 
 Environment variables (can also live in a .env file):
-    SURREALDB_URL, SURREALDB_NAMESPACE, SURREALDB_DATABASE,
-    SURREALDB_USERNAME, SURREALDB_PASSWORD, SURREALDB_VECTOR_DIM,
-    LIGHTRAG_WORKING_DIR, OLLAMA_HOST, MAX_CONCURRENT_INSERTS
+    LIBRARY_PATH, LIGHTRAG_WORKING_DIR (working dir / checkpoint location),
+    EMBEDDING_MODEL, OLLAMA_HOST, OLLAMA_MODEL, SURREALDB_VECTOR_DIM (embed dim),
+    NEO4J_URL, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import re
-import shutil
 import sys
 from dataclasses import dataclass, field, asdict
 from multiprocessing import Pool
@@ -60,16 +64,30 @@ from ebooklib import epub
 # semantic-text-splitter — pip install semantic-text-splitter
 from semantic_text_splitter import TextSplitter
 
-# sentence-transformers — pip install sentence-transformers
-from sentence_transformers import SentenceTransformer
+# LlamaIndex + Neo4j — the post-migration insertion stack (§5, §11 of Migration_LlamaIndex.md)
+from llama_index.core import PropertyGraphIndex
+from llama_index.core.storage.storage_context import StorageContext
+from llama_index.core.schema import (
+    TextNode,
+    RelatedNodeInfo,
+    NodeRelationship,
+    TransformComponent,
+)
+from llama_index.core.graph_stores.types import KG_NODES_KEY, KG_RELATIONS_KEY
+from llama_index.core.indices.property_graph import SimpleLLMPathExtractor
+from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
+from llama_index.llms.ollama import Ollama
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-# LightRAG — pip install lightrag-hku
-from lightrag import LightRAG, QueryParam
-from lightrag.kg.shared_storage import initialize_pipeline_status
-from lightrag.llm.ollama import ollama_model_complete, ollama_embed
-from lightrag.utils import EmbeddingFunc
+# Two-tier, chunk-level content-type + curated-slice classification (classify.py).
+from classify import classify as classify_content, is_curated
 
-from pipeline_profiler import Profiler
+# Optional per-stage profiler (moved to .archived_code during migration housekeeping).
+# --profile degrades to a warning if it isn't importable, rather than hard-failing.
+try:
+    from pipeline_profiler import Profiler
+except ModuleNotFoundError:
+    Profiler = None
 
 load_dotenv(override=True)
 console = Console()
@@ -115,13 +133,9 @@ class PipelineConfig:
     working_dir: Path
     extraction_workers: int = 8
     max_concurrent_inserts: int = 4
-    # Per-chunk insertion timeout (seconds). Guards against a single chunk whose
-    # Ollama entity-extraction "gleaning" loop runs away and wedges the whole run
-    # (the DB write path is already serialized by the adapter's _query_lock, so a
-    # straggler is far more likely to be a slow LLM step than DB contention).
-    # A chunk that exceeds this is logged with its source path and skipped; re-run
-    # with --from-checkpoint afterwards to re-attempt any that were skipped.
-    # 0 disables the timeout.
+    # Repurposed post-migration: the Ollama LLM request timeout (seconds) for the
+    # curated-slice entity extraction. A single extraction call runs several seconds
+    # (§10 ~3.9s median), so the LLM gets real headroom instead of the 30s default.
     insert_timeout: int = 300
     dedup_threshold: float = 0.85
     dedup_num_perm: int = 128
@@ -131,6 +145,15 @@ class PipelineConfig:
     ollama_model: str = "qwen2.5:14b"
     vector_dim: int = 384
     chunk_max_chars: int = 1500   # for semantic splitter
+    # Neo4j PropertyGraphStore connection (§11). Password comes from the env only —
+    # never commit it to config.yaml.
+    neo4j_url: str = "neo4j://127.0.0.1:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = ""
+    neo4j_database: str = "llamaindex"
+    # Curated-slice LLM extraction knobs (§10 — single pass, no gleaning).
+    max_paths_per_chunk: int = 10
+    extract_num_workers: int = 4
     # Map directory name fragments → content type
     content_type_rules: dict[str, str] = field(default_factory=lambda: {
         "software": "software",
@@ -147,14 +170,20 @@ class PipelineConfig:
 def load_config(path: str | None) -> PipelineConfig:
     defaults: dict[str, Any] = {
         "library_path": os.getenv("LIBRARY_PATH", "./library"),
-        "working_dir":  os.getenv("LIGHTRAG_WORKING_DIR", "./lightrag_data"),
+        "working_dir":  os.getenv("WORKING_DIR", os.getenv("LIGHTRAG_WORKING_DIR", "./lightrag_data")),
         "extraction_workers": int(os.getenv("EXTRACTION_WORKERS", "8")),
         "max_concurrent_inserts": int(os.getenv("MAX_CONCURRENT_INSERTS", "4")),
         "insert_timeout": int(os.getenv("INSERT_TIMEOUT", "300")),
         "embedding_model": os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
         "ollama_host":  os.getenv("OLLAMA_HOST",  "http://localhost:11434"),
         "ollama_model": os.getenv("OLLAMA_MODEL", "qwen2.5:14b"),
-        "vector_dim":   int(os.getenv("SURREALDB_VECTOR_DIM", "384")),
+        "vector_dim":   int(os.getenv("VECTOR_DIM", os.getenv("SURREALDB_VECTOR_DIM", "384"))),
+        "neo4j_url":      os.getenv("NEO4J_URL", "neo4j://127.0.0.1:7687"),
+        "neo4j_user":     os.getenv("NEO4J_USER", "neo4j"),
+        "neo4j_password": os.getenv("NEO4J_PASSWORD", ""),
+        "neo4j_database": os.getenv("NEO4J_DATABASE", "llamaindex"),
+        "max_paths_per_chunk": int(os.getenv("MAX_PATHS_PER_CHUNK", "10")),
+        "extract_num_workers": int(os.getenv("EXTRACT_NUM_WORKERS", "4")),
     }
     if path and Path(path).exists():
         with open(path) as f:
@@ -170,6 +199,12 @@ def load_config(path: str | None) -> PipelineConfig:
         ollama_host=defaults["ollama_host"],
         ollama_model=defaults["ollama_model"],
         vector_dim=defaults["vector_dim"],
+        neo4j_url=defaults["neo4j_url"],
+        neo4j_user=defaults["neo4j_user"],
+        neo4j_password=defaults["neo4j_password"],
+        neo4j_database=defaults["neo4j_database"],
+        max_paths_per_chunk=defaults["max_paths_per_chunk"],
+        extract_num_workers=defaults["extract_num_workers"],
     )
 
 
@@ -205,6 +240,11 @@ def classify(path: Path) -> str:
     """
     Infer content type from directory name fragments.
     Falls back to 'selfhelp' (full prose, no special handling).
+
+    NOTE: this path-based classifier only decides which *chunker* to run during
+    fresh extraction (chunk_software vs chunk_math vs chunk_prose). The final,
+    trustworthy content_type metadata written to the graph comes from the two-tier,
+    chunk-level classify.py at node-build time (§2.1 / chunk_to_nodes), not from here.
     """
     parts = [p.lower() for p in path.parts]
     for part in parts:
@@ -439,324 +479,292 @@ def load_chunks_checkpoint(config: PipelineConfig) -> list[Chunk]:
     return chunks
 
 
+# ---------------------------------------------------------------------------
+# Stable IDs — content-hash ref_doc_id (§0/§4), preserved MD5-of-path scheme
+# ---------------------------------------------------------------------------
+
+def content_hash_id(source_path: str) -> str:
+    """One stable ref_doc_id per source book: the 'book::' namespace + MD5 of the
+    source path. All chunks of a book share this id, so a book is a single ref_doc
+    (§3/§4) and --reset can purge the whole book namespace by prefix."""
+    digest = hashlib.md5(str(source_path).encode("utf-8")).hexdigest()
+    return f"book::{digest}"
 
 
 # ---------------------------------------------------------------------------
-# LightRAG initialisation
+# Chunk → LlamaIndex TextNode(s)  (§4)
 # ---------------------------------------------------------------------------
 
-def make_embedding_func(model_name: str, vector_dim: int) -> EmbeddingFunc:
+def _content_type_labels(text: str, source_path: str) -> list[str]:
+    """Two-tier content-type classification (classify.py): exact-title book labels
+    for the curated slice, else per-chunk density heuristics. Returns a sorted list
+    of type values — multi-label, since a chunk can legitimately be e.g.
+    ['math', 'python'] (§2.1). Replaces the unreliable path-based content_type."""
+    return sorted(ct.value for ct in classify_content(text, source_path))
+
+
+def chunk_to_nodes(chunk: Chunk) -> list[TextNode]:
+    """Build the base prose TextNode plus one linked TextNode per code block (§4).
+
+    ref_doc_id is set via the SOURCE relationship — NOT `node.ref_doc_id = ...`,
+    which is a read-only property in llama-index 0.14.x (see §7 Resolution). This is
+    also what delete/rebuild logic keys off, so it must be set correctly here.
     """
-    Build a LightRAG EmbeddingFunc using a local sentence-transformers model.
-    The model is loaded once and reused (CUDA if available).
-    """
-    _model = SentenceTransformer(model_name)
-
-    async def _embed(texts: list[str]) -> list[list[float]]:
-        loop = asyncio.get_event_loop()
-        # Run GPU inference in a thread pool to avoid blocking the event loop
-        # show_progress_bar=False: SentenceTransformer.encode() defaults to
-        # showing a tqdm bar whenever the logger is at INFO or below. Since
-        # this fires on every single embedding call (i.e. per chunk, at
-        # whatever concurrency the insertion semaphore allows), it was
-        # spamming a fresh "Batches" bar per call instead of updating one —
-        # tqdm's cursor control and Rich's Live display don't share a line.
-        # The outer "Inserting chunks" Rich bar already tracks real progress.
-        embeddings = await loop.run_in_executor(
-            None,
-            lambda: _model.encode(texts, convert_to_numpy=True, show_progress_bar=False).tolist()
-        )
-        return embeddings
-
-    return EmbeddingFunc(embedding_dim=vector_dim, max_token_size=512, func=_embed)
-
-
-def make_ollama_func(host: str):
-    """
-    Build an Ollama LLM func compatible with LightRAG's llm_model_func interface.
-    ollama_model_complete() doesn't take a `model` kwarg — it derives the model
-    name internally from kwargs["hashing_kv"].global_config["llm_model_name"],
-    which LightRAG always injects. Passing model= here leaks through into
-    _ollama_model_if_cache's **kwargs and collides with its positional model arg.
-    """
-    async def _llm(prompt: str, **kwargs) -> str:
-        return await ollama_model_complete(
-            prompt,
-            host=host,
-            **kwargs,
-        )
-    return _llm
-
-
-async def init_lightrag(config: PipelineConfig) -> LightRAG:
-    """Initialise LightRAG with the SurrealDB backend and local models."""
-    config.working_dir.mkdir(parents=True, exist_ok=True)
-    rag = LightRAG(
-        working_dir=str(config.working_dir),
-        llm_model_func=make_ollama_func(config.ollama_host),
-        llm_model_name=config.ollama_model,
-        embedding_func=make_embedding_func(config.embedding_model, config.vector_dim),
-        kv_storage="SurrealDBKVStorage",
-        vector_storage="SurrealDBVectorStorage",
-        graph_storage="SurrealDBGraphStorage",
-        doc_status_storage="SurrealDBDocStatusStorage",
+    doc_id = content_hash_id(chunk.source_path)
+    labels = _content_type_labels(chunk.text, chunk.source_path)
+    base = TextNode(
+        text=chunk.text,
+        metadata={
+            "source_type": "book",
+            "source_path": chunk.source_path,
+            "content_type": labels,
+            "has_code": bool(chunk.metadata.get("has_code") or chunk.code_blocks),
+        },
     )
-    await rag.initialize_storages()
-    # Required setup step LightRAG normally does during FastAPI lifespan —
-    # without it, pipeline_status["history_messages"] doesn't exist and the
-    # first ainsert() crashes after setting busy=True but before the
-    # try/finally that would reset it, permanently wedging every later
-    # insert into a silent no-op ("pipeline already busy") for the rest of
-    # the process.
-    await initialize_pipeline_status()
-    logger.info("LightRAG initialised with SurrealDB backend")
-    return rag
+    # This metadata is for retrieval FILTERING only, not semantic content. By default
+    # LlamaIndex prepends it into the text seen by both the embedder and the LLM
+    # extractor — which made SimpleLLMPathExtractor mine entities out of
+    # "source_type=book, has_code=False, source_path=..." instead of the prose. Exclude
+    # it from both representations so extraction/embedding see only the chunk text.
+    _exclude_metadata_from_content(base)
+    base.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
+    nodes: list[TextNode] = [base]
+    # code_blocks-as-separate-nodes (§4 knob): a code query should hit code, a
+    # concept query should hit prose — keep them as distinct retrievable nodes
+    # linked to the prose parent, not flattened into metadata.
+    for code in (chunk.code_blocks or []):
+        if not code.strip():
+            continue
+        cn = TextNode(
+            text=code,
+            metadata={
+                "source_type": "book",
+                "source_path": chunk.source_path,
+                "content_type": ["code"],
+                "parent": base.node_id,
+            },
+        )
+        _exclude_metadata_from_content(cn)
+        cn.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=doc_id)
+        nodes.append(cn)
+    return nodes
+
+
+def _exclude_metadata_from_content(node: TextNode) -> None:
+    """Keep node metadata out of the text the embedder and LLM extractor see — it's
+    filter metadata, not content (see chunk_to_nodes)."""
+    keys = list(node.metadata.keys())
+    node.excluded_llm_metadata_keys = keys
+    node.excluded_embed_metadata_keys = keys
 
 
 # ---------------------------------------------------------------------------
-# Insertion with checkpointing (via DocStatusStorage)
+# Embed-only extractor — the hybrid split's cheap side (§3)
 # ---------------------------------------------------------------------------
 
-async def insert_with_semaphore(
-    rag: LightRAG,
-    chunk: Chunk,
-    semaphore: asyncio.Semaphore,
-    progress: Progress | None = None,
-    task_id: Any = None,
-    timeout: float | None = None,
-) -> None:
-    """
-    Insert a single chunk into LightRAG under the semaphore.
-    Each chunk is inserted as its own LightRAG "document" — do not pass a
-    shared `ids` value across chunks from the same source file: LightRAG's
-    checkpoint dedup treats a repeated id as "already processed" regardless
-    of content, which would silently drop every chunk after the first one
-    for a given book. Content-hash IDs (the default when `ids` is omitted)
-    keep each chunk independently tracked and idempotent across re-runs.
+class EmbedOnlyExtractor(TransformComponent):
+    """A no-op kg_extractor for the embeddings-only path.
 
-    If a Rich progress + task_id are passed, the bar description is updated
-    to the source file *on semaphore acquire* (i.e. when this chunk actually
-    starts inserting, not when it finishes). This surfaces what's in flight:
-    with N concurrent inserts the description flickers among the N active
-    files (last-writer-wins), and when the run collapses to a single slow
-    straggler the description stabilises on that file's name — which is the
-    only way to see which chunk is hanging, since ainsert() itself is opaque.
+    PropertyGraphIndex._insert_nodes asserts every node carries KG node/relation
+    metadata keys (normally set by an extractor), so an EMPTY kg_extractors list is
+    not allowed — it would AssertionError. This stamps empty lists: the node is
+    embedded and stored as a vector-searchable Chunk but contributes no
+    entities/relations, which is exactly the embed-everything / extract-only-a-slice
+    hybrid (§3/§10)."""
 
-    `timeout` (seconds, None/0 = disabled) caps a single ainsert(). A chunk
-    that exceeds it — most likely a runaway Ollama gleaning loop, since the
-    adapter already serializes DB writes — is cancelled, logged with its
-    source path, and skipped so it can't wedge the whole run. Cancellation is
-    safe here: the adapter's _query_lock is released on CancelledError (it's
-    held only inside an `async with` around each individual query), and chunk
-    upserts are content-hash idempotent, so a --from-checkpoint re-run cleanly
-    re-attempts anything skipped. A skipped chunk is simply absent from the
-    graph until then, not half-written in a corrupt state.
-    """
-    async with semaphore:
-        if progress is not None and task_id is not None:
-            progress.update(task_id, description=f"Inserting {Path(chunk.source_path).name}")
-        try:
-            coro = rag.ainsert(chunk.text, file_paths=chunk.source_path)
-            if timeout:
-                await asyncio.wait_for(coro, timeout=timeout)
-            else:
-                await coro
-        except asyncio.TimeoutError:
-            logger.error(
-                f"Insert TIMED OUT after {timeout}s for a chunk from "
-                f"{chunk.source_path} — skipped. Re-run with --from-checkpoint "
-                f"to re-attempt. (Likely a runaway LLM entity-extraction step.)"
-            )
-        except Exception as exc:
-            logger.error(f"Insert failed for chunk from {chunk.source_path}: {exc}")
+    def __call__(self, nodes, **kwargs):
+        for node in nodes:
+            node.metadata[KG_NODES_KEY] = []
+            node.metadata[KG_RELATIONS_KEY] = []
+        return nodes
+
+    async def acall(self, nodes, **kwargs):
+        return self.__call__(nodes, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Neo4j PropertyGraphIndex setup (§5, §11)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Stores:
+    graph_store: Neo4jPropertyGraphStore
+    extract_index: PropertyGraphIndex   # curated slice → LLM entity extraction
+    embed_index: PropertyGraphIndex     # everything else → embeddings only
+
+
+def init_stores(config: PipelineConfig) -> Stores:
+    """Connect to Neo4j and build two PropertyGraphIndex views over the SAME store
+    and storage context: one runs SimpleLLMPathExtractor (curated slice), the other
+    runs the EmbedOnlyExtractor (rest). Routing the hybrid split by *index* — rather
+    than mutating one index's private `_kg_extractors` between batches — keeps it on
+    the public API. Neo4j persists server-side, so there is no explicit persist()."""
+    if not config.neo4j_password:
+        raise SystemExit(
+            "NEO4J_PASSWORD is not set (env or .env). Refusing to connect to Neo4j."
+        )
+
+    graph_store = Neo4jPropertyGraphStore(
+        username=config.neo4j_user,
+        password=config.neo4j_password,
+        url=config.neo4j_url,
+        database=config.neo4j_database,
+    )
+    storage = StorageContext.from_defaults(property_graph_store=graph_store)
+
+    llm = Ollama(
+        model=config.ollama_model,
+        base_url=config.ollama_host,
+        request_timeout=float(config.insert_timeout) if config.insert_timeout else 600.0,
+    )
+    embed = HuggingFaceEmbedding(model_name=config.embedding_model)
+
+    common = dict(
+        property_graph_store=graph_store,
+        embed_model=embed,
+        storage_context=storage,
+        show_progress=True,
+    )
+    extract_index = PropertyGraphIndex.from_existing(
+        llm=llm,
+        kg_extractors=[SimpleLLMPathExtractor(
+            llm=llm,
+            max_paths_per_chunk=config.max_paths_per_chunk,
+            num_workers=config.extract_num_workers,
+        )],
+        **common,
+    )
+    embed_index = PropertyGraphIndex.from_existing(
+        kg_extractors=[EmbedOnlyExtractor()],
+        **common,
+    )
+    logger.info(
+        f"Neo4j PropertyGraphIndex ready at {config.neo4j_url} (db={config.neo4j_database}); "
+        f"LLM={config.ollama_model}, embed={config.embedding_model}"
+    )
+    return Stores(graph_store, extract_index, embed_index)
+
+
+def reset_book_namespace(graph_store: Neo4jPropertyGraphStore) -> None:
+    """--reset: purge ONLY the book namespace from Neo4j (source_type='book' or the
+    'book::' id/ref_doc_id namespace), leaving notes untouched. Mirrors the note
+    rebuild purge (§7) scoped to books. Replaces the old SurrealKV file delete."""
+    graph_store.structured_query(
+        """
+        MATCH (n)
+        WHERE n.source_type = 'book'
+           OR n.id STARTS WITH 'book::'
+           OR n.ref_doc_id STARTS WITH 'book::'
+        DETACH DELETE n
+        """
+    )
+    logger.warning("--reset: purged the book namespace (source_type='book') from Neo4j")
 
 
 # ---------------------------------------------------------------------------
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
-def reset_database(config: PipelineConfig) -> None:
-    """
-    Delete the embedded SurrealKV database so the next init rebuilds it from
-    scratch. For an embedded file-based store this is the reliable equivalent
-    of "drop and rebuild all tables" — it clears every namespace/table in one
-    step, and the storage classes recreate their schema via
-    `DEFINE TABLE IF NOT EXISTS ...` on the next `initialize()`.
+def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: bool = False, profile: bool = False) -> None:
+    # Stage 1: connect to Neo4j and build the two index views.
+    stores = init_stores(config)
 
-    Must run BEFORE init_lightrag() connects, since connecting opens the file.
-    """
-    db_path = Path(os.getenv("SURREALDB_PATH", str(config.working_dir / "graphrag.db")))
-    if db_path.exists():
-        if db_path.is_dir():
-            shutil.rmtree(db_path)
-        else:
-            db_path.unlink()
-        logger.warning(f"--reset: removed embedded database at {db_path}")
-    else:
-        logger.info(f"--reset: no existing database found at {db_path}")
-
-
-async def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: bool = False, profile: bool = False) -> None:
-    # Stage 0: (Optional) reset existing data — must happen before we connect
+    # Stage 0: (optional) purge the book namespace before re-ingesting.
     if reset:
-        reset_database(config)
+        reset_book_namespace(stores.graph_store)
 
-    profiler = Profiler(out_dir=str(config.working_dir / "profile_results")) if profile else None
+    if profile and Profiler is None:
+        logger.warning("--profile requested but pipeline_profiler is unavailable (archived); continuing without profiling")
+    profiler = Profiler(out_dir=str(config.working_dir / "profile_results")) if (profile and Profiler is not None) else None
 
     def stage(name: str, **meta):
         return profiler.stage(name, **meta) if profiler else contextlib.nullcontext()
 
-    # Stage 1: Initialise LightRAG + SurrealDB
-    rag = await init_lightrag(config)
-    try:
-        if from_checkpoint and checkpoint_path(config).exists():
-            chunks = load_chunks_checkpoint(config)
-        else:
-            if from_checkpoint:
-                logger.warning(f"--from-checkpoint set but no checkpoint found at {checkpoint_path(config)}; running full pipeline")
+    # Stage 2–4: obtain the deduped chunk list (from checkpoint, or fresh).
+    if from_checkpoint and checkpoint_path(config).exists():
+        chunks = load_chunks_checkpoint(config)
+    else:
+        if from_checkpoint:
+            logger.warning(f"--from-checkpoint set but no checkpoint found at {checkpoint_path(config)}; running full pipeline")
 
-            files = discover_files(config.library_path)
-            if not files:
-                logger.warning(f"No PDF/EPUB files found under {config.library_path}")
-                return
+        files = discover_files(config.library_path)
+        if not files:
+            logger.warning(f"No PDF/EPUB files found under {config.library_path}")
+            return
 
-            # Stage 3: Parallel extraction (CPU-bound → multiprocessing)
-            # NOTE: worker count is capped well below cpu_count() — each worker runs a full
-            # docling+EasyOCR pipeline that can need several GB for large PDFs, so a high
-            # process count risks OOM (workers silently drop documents via MemoryError,
-            # producing a near-empty result set instead of a clean failure).
-            logger.info(f"Extracting {len(files)} documents using {config.extraction_workers} workers...")
-            all_chunks: list[Chunk] = []
-            with stage("extraction", n_files=len(files)):
-                with make_progress() as progress, Pool(processes=config.extraction_workers) as pool:
-                    task = progress.add_task("Extracting documents", total=len(files))
-                    for name, doc_chunks in pool.imap_unordered(extract_document, files):
-                        all_chunks.extend(doc_chunks)
-                        progress.update(task, description=f"Extracted {name}")
-                        progress.advance(task)
-
-            logger.info(f"Extraction complete: {len(all_chunks)} raw chunks")
-
-            # Stage 4: Deduplication
-            with stage("deduplication", n_chunks=len(all_chunks)):
-                chunks = deduplicate(
-                    all_chunks,
-                    threshold=config.dedup_threshold,
-                    num_perm=config.dedup_num_perm,
-                    k=config.dedup_shingle_k,
-                )
-
-            # Checkpoint: persist the post-dedup chunk list before insertion begins
-            save_chunks_checkpoint(chunks, config)
-
-        # Stage 5: Async insertion into LightRAG / SurrealDB — runs on BOTH the
-        # checkpoint-resume path and the fresh-run path, not just the latter.
-        # NOTE: this single stage covers embedding + entity extraction + SurrealDB
-        # write together — LightRAG's ainsert() bundles all three into one opaque
-        # async call, so there's no hook point to time them individually.
-        logger.info(f"Inserting {len(chunks)} chunks (concurrency={config.max_concurrent_inserts})...")
-        with stage("lightrag_insertion", n_chunks=len(chunks), concurrency=config.max_concurrent_inserts):
-            semaphore = asyncio.Semaphore(config.max_concurrent_inserts)
-            with make_progress() as progress:
-                task = progress.add_task("Inserting chunks", total=len(chunks))
-                tasks = [
-                    insert_with_semaphore(rag, chunk, semaphore, progress, task, config.insert_timeout)
-                    for chunk in chunks
-                ]
-                for coro in asyncio.as_completed(tasks):
-                    await coro
+        # Parallel extraction (CPU-bound → multiprocessing).
+        # NOTE: worker count is capped well below cpu_count() — each worker runs a full
+        # docling+EasyOCR pipeline that can need several GB for large PDFs, so a high
+        # process count risks OOM (workers silently drop documents via MemoryError,
+        # producing a near-empty result set instead of a clean failure).
+        logger.info(f"Extracting {len(files)} documents using {config.extraction_workers} workers...")
+        all_chunks: list[Chunk] = []
+        with stage("extraction", n_files=len(files)):
+            with make_progress() as progress, Pool(processes=config.extraction_workers) as pool:
+                task = progress.add_task("Extracting documents", total=len(files))
+                for name, doc_chunks in pool.imap_unordered(extract_document, files):
+                    all_chunks.extend(doc_chunks)
+                    progress.update(task, description=f"Extracted {name}")
                     progress.advance(task)
 
-        logger.info("Ingestion pipeline complete.")
-        if profiler:
-            profiler.report()
-    finally:
-        # Embedded SurrealKV buffers writes — without this, data can be lost
-        # if the process exits without an explicit flush/close. On a large
-        # graph this flush is not instant, so give it its own visible phase
-        # AND an elapsed-time heartbeat.
-        #
-        # Why not rely on the spinner: Rich drives spinner animation from a
-        # background refresh thread on wall-clock time, so it keeps spinning
-        # even if finalize is wedged — it can't distinguish progress from a
-        # hang. The heartbeat below only logs while the event loop is actually
-        # being serviced, so:
-        #   - ticking heartbeat  → finalize is progressing / async-waiting
-        #   - frozen heartbeat   → the call is blocking the loop in native
-        #                          code (busy or deadlocked); attach with
-        #                          `py-spy dump --pid <PID>` from another
-        #                          terminal, or drop in
-        #                          faulthandler.dump_traceback_later(30, repeat=True)
-        #                          before this block, to see exactly where.
-        # shield() keeps the 5s poll timeout from cancelling the flush —
-        # cancelling finalize mid-write is exactly the data loss it prevents.
-        with make_progress() as progress:
-            progress.add_task("Flushing to SurrealDB (finalizing storages)", total=None)
-            finalize_task = asyncio.create_task(rag.finalize_storages())
-            waited = 0
-            while not finalize_task.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(finalize_task), timeout=5)
-                except asyncio.TimeoutError:
-                    waited += 5
-                    logger.info(f"finalize_storages() still running… {waited}s elapsed")
-            await finalize_task  # surface any exception raised by finalize
+        logger.info(f"Extraction complete: {len(all_chunks)} raw chunks")
+
+        # Deduplication
+        with stage("deduplication", n_chunks=len(all_chunks)):
+            chunks = deduplicate(
+                all_chunks,
+                threshold=config.dedup_threshold,
+                num_perm=config.dedup_num_perm,
+                k=config.dedup_shingle_k,
+            )
+
+        # Checkpoint: persist the post-dedup chunk list before insertion begins
+        save_chunks_checkpoint(chunks, config)
+
+    # Stage 5: hybrid node build + insertion (§5).
+    # Split chunks by curated-slice membership: curated books get full LLM entity
+    # extraction; everything else is embeddings-only but still vector-searchable.
+    curated_nodes: list[TextNode] = []
+    embed_nodes: list[TextNode] = []
+    curated_books: set[str] = set()
+    embed_books: set[str] = set()
+    for c in chunks:
+        stem = Path(c.source_path).stem
+        if is_curated(c.source_path):
+            curated_nodes.extend(chunk_to_nodes(c))
+            curated_books.add(stem)
+        else:
+            embed_nodes.extend(chunk_to_nodes(c))
+            embed_books.add(stem)
+
+    logger.info(
+        f"Hybrid split: {len(curated_nodes)} node(s) from {len(curated_books)} curated book(s) "
+        f"→ LLM extraction; {len(embed_nodes)} node(s) from {len(embed_books)} book(s) → embeddings-only"
+    )
+
+    # Embed-only first (fast, no LLM), then the curated slice (slow LLM extraction).
+    if embed_nodes:
+        with stage("embed_only_insertion", n_nodes=len(embed_nodes)):
+            logger.info(f"Inserting {len(embed_nodes)} embeddings-only node(s)...")
+            stores.embed_index.insert_nodes(embed_nodes)
+    if curated_nodes:
+        with stage("curated_extraction_insertion", n_nodes=len(curated_nodes)):
+            logger.info(f"Extracting + inserting {len(curated_nodes)} curated-slice node(s) via LLM...")
+            stores.extract_index.insert_nodes(curated_nodes)
+
+    logger.info("Ingestion pipeline complete.")
+    if profiler:
+        profiler.report()
 
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def _shutdown_loop(loop: asyncio.AbstractEventLoop, timeout: float = 10.0) -> None:
-    """
-    Bounded replacement for the teardown asyncio.run() does after the main
-    coroutine finishes.
-
-    asyncio.run()'s built-in _cancel_all_tasks() cancels leftover tasks and then
-    waits on an UNBOUNDED `gather(*leftover, return_exceptions=True)`. If a
-    third-party async resource leaves a task parked on a native Windows IOCP read
-    — e.g. LightRAG's Ollama/httpx client, or LLM sub-tasks orphaned when a
-    runaway ainsert() is cancelled by the per-chunk insert_timeout — that gather
-    never returns, and the process hangs in `GetQueuedCompletionStatus` at the
-    "finalizing storages" line with all data already flushed.
-
-    This does the same cancel-and-drain but:
-      (a) logs the repr() of every leftover task first, so the actual leak can be
-          identified and closed properly (the real fix is usually an explicit
-          client .aclose() before shutdown), and
-      (b) waits only `timeout` seconds before abandoning any task that refuses to
-          cancel and forcing the loop shut. wait_for schedules a loop callback, so
-          on the proactor loop this is guaranteed to wake and return rather than
-          blocking in the completion port forever.
-    Abandoning leftovers is safe here: finalize_storages() already flushed
-    SurrealKV, so the orphaned tasks are just network connections we don't need.
-    """
-    pending = list(asyncio.all_tasks(loop))
-    if pending:
-        logger.warning(f"{len(pending)} task(s) still pending at shutdown; cancelling:")
-        for t in pending:
-            logger.warning(f"  leftover task: {t.get_coro()!r}")
-            t.cancel()
-        try:
-            loop.run_until_complete(
-                asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True),
-                    timeout=timeout,
-                )
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"Leftover task(s) did not cancel within {timeout}s — abandoning them "
-                "and forcing shutdown. Data was already flushed by finalize_storages(), "
-                "so this is safe; the repr(s) above identify what to close explicitly."
-            )
-    loop.run_until_complete(loop.shutdown_asyncgens())
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GraphRAG Assistant ingestion pipeline")
+    parser = argparse.ArgumentParser(description="GraphRAG Assistant ingestion pipeline (LlamaIndex + Neo4j)")
     parser.add_argument("--config", default=None, help="Path to config.yaml")
-    parser.add_argument("--reset", action="store_true", help="Drop and rebuild SurrealDB tables")
+    parser.add_argument("--reset", action="store_true", help="Purge the book namespace in Neo4j before ingesting")
     parser.add_argument(
         "--from-checkpoint",
         action="store_true",
@@ -767,61 +775,16 @@ def main() -> None:
         action="store_true",
         help="Enable per-stage timing via pipeline_profiler (writes to working_dir/profile_results)",
     )
-    parser.add_argument(
-        "--debug-finalize",
-        action="store_true",
-        help=(
-            "Diagnose end-of-run hangs. Arms faulthandler to dump every thread's "
-            "stack to finalize_traceback.log on a timer (default 30s, override with "
-            "DEBUG_FINALIZE_INTERVAL). The timer runs on a dedicated C thread, so it "
-            "fires even when the main thread is fully blocked — capturing a hang in "
-            "finalize_storages() OR in asyncio.run()'s _cancel_all_tasks teardown "
-            "(which a finalize-only probe would miss). Off by default; only pass it "
-            "when actively chasing a hang. Dumps go to a file, not the console, so "
-            "they don't disturb the Rich progress UI."
-        ),
-    )
     args = parser.parse_args()
 
     config = load_config(args.config)
+    run_pipeline(
+        config,
+        reset=args.reset,
+        from_checkpoint=args.from_checkpoint,
+        profile=args.profile,
+    )
 
-    # --debug-finalize: arm faulthandler for the WHOLE asyncio.run(), not just the
-    # finalize block. The py-spy dump that motivated this flag showed the process
-    # parked in asyncio.run's _cancel_all_tasks teardown — i.e. *after* run_pipeline
-    # returned — so a probe scoped only to finalize_storages() would never see it.
-    # Wrapping the whole run covers finalize, the teardown sweep, and any insertion
-    # straggler too. Line-buffered file so the last dump survives a hard kill.
-    dump_fh = None
-    if args.debug_finalize:
-        import faulthandler
-        interval = int(os.getenv("DEBUG_FINALIZE_INTERVAL", "30"))
-        dump_fh = open("finalize_traceback.log", "w", buffering=1)
-        faulthandler.enable(file=dump_fh)
-        faulthandler.dump_traceback_later(interval, repeat=True, file=dump_fh)
-        logger.info(
-            f"--debug-finalize: dumping all thread stacks every {interval}s "
-            f"to finalize_traceback.log"
-        )
-
-    # Manage the loop manually instead of asyncio.run() so we control teardown:
-    # asyncio.run()'s built-in _cancel_all_tasks waits forever on leftover tasks,
-    # which is the observed hang. _shutdown_loop() bounds and logs that instead.
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(run_pipeline(
-            config,
-            reset=args.reset,
-            from_checkpoint=args.from_checkpoint,
-            profile=args.profile,
-        ))
-    finally:
-        _shutdown_loop(loop)
-        if dump_fh is not None:
-            import faulthandler
-            faulthandler.cancel_dump_traceback_later()
-            dump_fh.close()
-        loop.close()
 
 if __name__ == "__main__":
     main()
