@@ -80,7 +80,9 @@ from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 # Two-tier, chunk-level content-type + curated-slice classification (classify.py).
-from classify import classify as classify_content, is_curated
+# classify_content (Tier1+Tier2) → per-chunk content_type metadata (chunk_to_nodes);
+# route_signals → document-level content densities for chunker routing (§2.1).
+from classify import classify as classify_content, route_signals, is_curated, ContentType
 
 # Optional per-stage profiler (moved to .archived_code during migration housekeeping).
 # --profile degrades to a warning if it isn't importable, rather than hard-failing.
@@ -222,35 +224,55 @@ def discover_files(library_path: Path) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Content-type classification
+# Chunker routing — content-based (§2.1)
 # ---------------------------------------------------------------------------
 
-_CONTENT_TYPE_RULES: dict[str, str] = {
-    "software": "software",
-    "dev":      "software",
-    "code":     "software",
-    "math":     "math",
-    "maths":    "math",
-    "self":     "selfhelp",
-    "help":     "selfhelp",
-    "personal": "selfhelp",
-}
+# Document-scaled routing thresholds. classify.py's per-CHUNK threshold (2.5
+# matches/1000 chars) is far too high for whole-document routing — measured book-level
+# densities run ~0.02–2.1 — so these are separate, PROVISIONAL values fit to the 7-file
+# checkpoint sample; re-validate on a larger sample before trusting them broadly.
+#   math ~2.1 (real math book) vs ≤0.4 (prose)  -> a 1.0 floor separates cleanly
+#   software density is weak everywhere; genuine fenced code is the reliable signal
+_MATH_DENSITY_FLOOR = 1.0
+_SOFT_DENSITY_FLOOR = 0.3   # well above prose (~0.02); catches dense inline code w/o fences
+_FENCE_FLOOR = 1           # any single genuine (code-token-bearing) fenced block
 
-def classify(path: Path) -> str:
-    """
-    Infer content type from directory name fragments.
-    Falls back to 'selfhelp' (full prose, no special handling).
 
-    NOTE: this path-based classifier only decides which *chunker* to run during
-    fresh extraction (chunk_software vs chunk_math vs chunk_prose). The final,
-    trustworthy content_type metadata written to the graph comes from the two-tier,
-    chunk-level classify.py at node-build time (§2.1 / chunk_to_nodes), not from here.
+def _route_chunker(raw: str, path: Path) -> str:
+    """Pick the chunker for a document from its CONTENT, not its path (§2.1).
+
+    The old path-based classify() keyed off directory-name fragments, but the library
+    is flat, so almost everything defaulted to 'selfhelp' — math books skipped LaTeX
+    handling and code books skipped code-block extraction. This combines two signals:
+
+      1. Curated hand-labels (classify_content Tier 1) — authoritative for the 19
+         curated books the user labeled by hand.
+      2. Document-scaled content densities (classify.route_signals) — for everything
+         else, and as a supplement (a curated {ALGORITHMS, ML} label says nothing about
+         whether the book physically contains code worth extracting).
+
+    Code takes priority over math for books that are both (e.g. a Python+math workshop):
+    un-extracted code pollutes prose chunks more than residual LaTeX does.
+
+    KNOWN GAP: books whose code docling leaves INLINE (no ``` fences) score ~0 on every
+    signal and fall through to prose — see the .NET fundamentals case in §2.1. The
+    typed-subfolder fallback (§2.1) is the real fix for those; not handled here.
     """
-    parts = [p.lower() for p in path.parts]
-    for part in parts:
-        for keyword, ctype in _CONTENT_TYPE_RULES.items():
-            if keyword in part:
-                return ctype
+    labels = classify_content(raw, str(path))
+    sig = route_signals(raw)
+    has_code = (
+        ContentType.SOFTWARE in labels or ContentType.PYTHON in labels
+        or sig["fences"] >= _FENCE_FLOOR
+        or sig["software"] >= _SOFT_DENSITY_FLOOR
+    )
+    has_math = (
+        ContentType.MATH in labels or ContentType.DISCRETE_MATH in labels
+        or sig["math"] >= _MATH_DENSITY_FLOOR
+    )
+    if has_code:
+        return "software"
+    if has_math:
+        return "math"
     return "selfhelp"
 
 
@@ -389,9 +411,9 @@ def chunk_prose(text: str, source_path: str, content_type: str, max_chars: int =
 
 
 def apply_content_rules(raw: str, path: Path) -> list[Chunk]:
-    """Dispatch to the correct chunker based on classified content type."""
+    """Dispatch to the correct chunker based on the document's content (§2.1)."""
     source = str(path)
-    ctype = classify(path)
+    ctype = _route_chunker(raw, path)
     if ctype == "software":
         return chunk_software(raw, source)
     elif ctype == "math":

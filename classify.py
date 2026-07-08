@@ -51,11 +51,12 @@ BOOK_LABELS: dict[str, frozenset[ContentType]] = {
     "Clean Code": frozenset({ContentType.SOFTWARE, ContentType.FOUNDATION}),
     "Code Complete": frozenset({ContentType.SOFTWARE, ContentType.FOUNDATION}),
     "Fundamentals of Software Architecture": frozenset({ContentType.ARCHITECTURE}),
-    "Software Architecture: The Hard Parts": frozenset({ContentType.ARCHITECTURE}),
+    "Software Architecture The Hard Parts": frozenset({ContentType.ARCHITECTURE}),
     "A Mathematical Introduction to Data Science": frozenset({ContentType.MATH}),
     "Stats and Calculus Workshop with Python": frozenset({ContentType.MATH, ContentType.PYTHON}),
     "Mathematics of Machine Learning": frozenset({ContentType.ML, ContentType.MATH}),
-    "An Introduction to Statistical Learning": frozenset({ContentType.ML, ContentType.MATH}),
+    "An Introduction to Statistical Learning with Applications in Python": frozenset({ContentType.ML, ContentType.MATH}),
+    "The Elements of Statistical Learning": frozenset({ContentType.ML, ContentType.MATH}),
     "An Introduction to the Analysis of Algorithms": frozenset({ContentType.ALGORITHMS}),
     "Mathematical Structures for Computer Science": frozenset(
         {ContentType.DISCRETE_MATH, ContentType.ALGORITHMS, ContentType.DATA}
@@ -184,6 +185,24 @@ def classify_chunk(text: str) -> frozenset[ContentType]:
     if _fenced_code_block_count(text) >= 1:
         hits.add(ContentType.SOFTWARE)
     return frozenset(hits) if hits else _DEFAULT
+
+
+def route_signals(text: str) -> dict[str, float]:
+    """Raw content signals for DOCUMENT-level chunker routing (ingest.py §2.1).
+
+    classify_chunk()'s frozenset output can't drive whole-document routing: its
+    threshold (_THRESHOLD_PER_1000_CHARS) is calibrated for individual chunks, and
+    those signals dilute badly over a whole book (measured book-level densities run
+    ~0.02–2.1, never near 2.5). This returns the underlying densities + genuine-code
+    fence count so the caller can apply its own document-scaled thresholds instead of
+    inheriting the per-chunk one.
+    """
+    return {
+        "math": _score(text, _PATTERNS[ContentType.MATH]),
+        "software": _score(text, _PATTERNS[ContentType.SOFTWARE]),
+        "python": _score(text, _PATTERNS[ContentType.PYTHON]),
+        "fences": float(_fenced_code_block_count(text)),
+    }
 
 
 def classify(text: str, source_path: str) -> frozenset[ContentType]:
