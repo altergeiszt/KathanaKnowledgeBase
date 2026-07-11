@@ -179,10 +179,12 @@ class PipelineConfig:
     # Split out so extraction can use a fast small model independent of any future
     # query-role model.
     extract_model: str = ""
-    # Thinking mode for the extraction LLM: "auto" | "on" | "off". "auto" disables
-    # thinking for thinking-capable models (qwen3, deepseek-r1, gpt-oss, …) — which is
-    # what you want for high-volume structured extraction — and leaves it unset for
-    # non-thinking models like qwen2.5 (sending think:false to those can error).
+    # Thinking mode for the extraction LLM: "auto" | "on" | "off" | "none".
+    # "auto" disables thinking for thinking-capable models (qwen3, deepseek-r1, gpt-oss,
+    # …) — what you want for high-volume structured extraction — and leaves it unset for
+    # non-thinking models like qwen2.5 (sending think:false to those can error). "none"
+    # OMITS the flag entirely regardless of the model name — the escape hatch for a model
+    # the name heuristic misjudges (e.g. a new family that doesn't accept `think`).
     extract_thinking: str = "auto"
     vector_dim: int = 384
     chunk_max_chars: int = 1500   # for semantic splitter
@@ -911,13 +913,18 @@ def _resolve_thinking(model: str, setting: str) -> bool | None:
 
     Returns False (disable) / True (enable) / None (omit the flag — the model default).
     None is important for non-thinking models (e.g. qwen2.5): sending think:false to a
-    model that doesn't support thinking can error, so "auto" omits it for those.
+    model that doesn't support thinking can error, so "auto"/"none" omit it for those.
     """
     setting = (setting or "auto").strip().lower()
     if setting == "on":
         return True
     if setting == "off":
         return False
+    if setting == "none":
+        # Escape hatch: omit the flag regardless of the model-name heuristic — use this
+        # when a model is misjudged as thinking-capable (e.g. a new family) and rejects
+        # the `think` param.
+        return None
     # auto: disable thinking for thinking-capable models, leave others untouched.
     return False if _is_thinking_model(model) else None
 
