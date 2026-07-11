@@ -756,10 +756,18 @@ def insert_chunks_batched(
     *,
     label: str,
     batch_chunks: int = EXTRACT_BATCH_CHUNKS,
+    reset_llm: Any = None,
 ) -> int:
     """Insert nodes for chunks_subset in chunk-batches, skipping any already recorded
     done in progress[bucket], checkpointing progress after each committed batch. Returns
-    the node count inserted this run."""
+    the node count inserted this run.
+
+    reset_llm (the extraction Ollama LLM, curated path only): PropertyGraphIndex.insert_nodes
+    spins a fresh asyncio event loop per call and closes it, but the Ollama LLM caches its
+    httpx AsyncClient bound to the FIRST loop — so batch 2+ would reuse a client tied to a
+    closed loop and raise "RuntimeError: Event loop is closed". Dropping the cached client
+    before each batch forces a fresh one bound to that batch's loop.
+    """
     done = progress[bucket]
     pending = [c for c in chunks_subset if _chunk_key(c) not in done]
     skipped = len(chunks_subset) - len(pending)
@@ -776,6 +784,10 @@ def insert_chunks_batched(
         for c in batch:
             nodes.extend(chunk_to_nodes(c))
         logger.info(f"{label}: batch {bi}/{total_batches} - {len(nodes)} node(s) from {len(batch)} chunk(s)...")
+        if reset_llm is not None:
+            # Force a fresh AsyncClient on this batch's event loop (see docstring).
+            reset_llm._client = None
+            reset_llm._async_client = None
         index.insert_nodes(nodes)                 # commits to Neo4j
         for c in batch:                           # mark done only AFTER the commit
             done.add(_chunk_key(c))
@@ -896,6 +908,7 @@ class Stores:
     graph_store: Neo4jPropertyGraphStore
     extract_index: PropertyGraphIndex   # curated slice → LLM entity extraction
     embed_index: PropertyGraphIndex     # everything else → embeddings only
+    extract_llm: Ollama                 # the extraction LLM (client reset between batches)
 
 
 # Substrings that mark a hybrid-reasoning ("thinking") model. Used only by the "auto"
@@ -984,7 +997,7 @@ def init_stores(config: PipelineConfig) -> Stores:
         f"Neo4j PropertyGraphIndex ready at {config.neo4j_url} (db={config.neo4j_database}); "
         f"extract_model={config.extract_model}, embed={config.embedding_model}"
     )
-    return Stores(graph_store, extract_index, embed_index)
+    return Stores(graph_store, extract_index, embed_index, llm)
 
 
 def reset_book_namespace(graph_store: Neo4jPropertyGraphStore) -> None:
@@ -1285,7 +1298,7 @@ def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: b
         with stage("curated_extraction_insertion", n_chunks=len(curated_chunks)):
             n = insert_chunks_batched(
                 stores.extract_index, curated_chunks, progress, "curated", config,
-                label="Curated LLM extraction",
+                label="Curated LLM extraction", reset_llm=stores.extract_llm,
             )
             logger.info(f"Curated extraction complete ({n} node(s) inserted this run).")
 
@@ -1334,15 +1347,24 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
-    run_pipeline(
-        config,
-        reset=args.reset,
-        from_checkpoint=args.from_checkpoint,
-        profile=args.profile,
-        extract_only=args.extract_only,
-        require_curated=args.require_curated,
-        skip_preflight=args.skip_preflight,
-    )
+    try:
+        run_pipeline(
+            config,
+            reset=args.reset,
+            from_checkpoint=args.from_checkpoint,
+            profile=args.profile,
+            extract_only=args.extract_only,
+            require_curated=args.require_curated,
+            skip_preflight=args.skip_preflight,
+        )
+    except SystemExit:
+        raise  # clean, intentional exits (preflight/guards) — already logged their reason
+    except BaseException:
+        # Persist the fatal traceback to the file log too — an uncaught exception
+        # otherwise goes only to stderr, so an overnight crash left no on-disk cause
+        # (exactly what happened diagnosing the Event-loop-closed batch crash).
+        logger.exception("Ingestion pipeline crashed with an unhandled exception")
+        raise
 
 
 if __name__ == "__main__":
