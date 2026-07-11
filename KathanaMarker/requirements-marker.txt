@@ -1,8 +1,14 @@
-# GraphRAG Assistant — Python dependencies
-# Install with: pip install -r requirements.txt
+# GraphRAG Assistant — Python dependencies — MARKER-PARSER VARIANT (DEFERRED)
+# ============================================================================
+# This is requirements.txt with docling swapped for marker-pdf. It pairs with
+# ingest_marker.py. NOT the MVP env — install into a SEPARATE venv, never the
+# docling-based production .venv. Resolution verified clean (129 pkgs, 0 conflicts,
+# 2026-07-10): pillow→10.4.0, click→8.4.2, torch stays 2.12.1+cu130, typer gone.
+# See MARKER_CONVERSION.md for the full story.
+#   Install with: pip install -r requirements-marker.txt
 #
-# GPU note: docling and sentence-transformers both auto-detect CUDA via
-# torch.cuda.is_available() — no code changes needed, just a CUDA-enabled
+# GPU note: Marker (surya models) and sentence-transformers both auto-detect CUDA
+# via torch.cuda.is_available() — no code changes needed, just a CUDA-enabled
 # torch build. For CPU-only environments, drop the --extra-index-url line
 # and the "+cu130" suffix below; everything still works, just slower.
 --extra-index-url https://download.pytorch.org/whl/cu130
@@ -11,7 +17,9 @@
 torch==2.12.1+cu130
 
 # ── Document extraction ───────────────────────────────────────────────────────
-docling==2.31.0              # PDF extraction with layout understanding
+marker-pdf==1.10.2           # PDF extraction w/ layout + LaTeX math (surya models)
+pillow<11                    # surya/marker constraint (docling's <12 no longer applies)
+click>=8.2                   # marker CLI constraint (typer no longer pins click<8.2)
 ebooklib==0.18               # EPUB parsing
 beautifulsoup4==4.12.3       # HTML stripping for EPUB chapters
 lxml==5.2.2                  # BeautifulSoup XML parser backend

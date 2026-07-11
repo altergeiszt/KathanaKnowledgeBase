@@ -1,11 +1,23 @@
 """
-ingest.py
+ingest_marker.py — MARKER-PARSER VARIANT (DEFERRED / not the MVP pipeline).
+
+This is a standalone copy of ingest.py whose ONLY difference is the PDF extractor:
+Marker (marker-pdf) instead of docling. It captures math as LaTeX ($$...$$), which
+fixes pure-math books misrouting to 'selfhelp' — but at ~8-9x docling's runtime.
+That tradeoff was judged not worth it for the MVP; math-heavy books are slated for
+a dedicated pipeline post-MVP. Kept here so the conversion work is not lost. See
+MARKER_CONVERSION.md for the full rationale, dependency analysis, and diff summary.
+
+DO NOT run this in the production .venv (still docling-based). It needs its own env
+with marker-pdf==1.10.2 (pillow<11, click>=8.2) — see requirements-marker.txt and
+MARKER_CONVERSION.md §"Environment". To adopt it, this file's contents replace
+ingest.py and requirements-marker.txt replaces requirements.txt.
 
 GraphRAG Assistant — Document Ingestion Pipeline (LlamaIndex + Neo4j)
 
 Orchestrates:
   1. File discovery
-  2. PDF/EPUB extraction (multiprocessing, CPU-bound) — docling
+  2. PDF/EPUB extraction (multiprocessing, GPU-bound for PDF) — Marker
   3. Deduplication (MinHash LSH)
   4. Node building + HYBRID insertion into a Neo4j PropertyGraphIndex:
        - curated-slice books (classify.is_curated) → LLM entity extraction
@@ -15,12 +27,12 @@ Orchestrates:
      kg_extractors while every chunk is still embedded and vector-searchable (§3).
 
 Usage:
-    python ingest.py [--config config.yaml] [--reset] [--from-checkpoint] [--profile]
+    python ingest_marker.py [--config config.yaml] [--reset] [--from-checkpoint] [--profile]
 
 Environment variables (can also live in a .env file):
     LIBRARY_PATH, LIGHTRAG_WORKING_DIR (working dir / checkpoint location),
     EMBEDDING_MODEL, OLLAMA_HOST, OLLAMA_MODEL, SURREALDB_VECTOR_DIM (embed dim),
-    NEO4J_URL, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE
+    NEO4J_URL, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE, EXTRACTION_WORKERS
 """
 
 from __future__ import annotations
@@ -54,8 +66,12 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-# docling — pip install docling
-from docling.document_converter import DocumentConverter
+# Marker — pip install marker-pdf. Captures math as LaTeX ($$...$$), which docling
+# dropped — the fix for pure-math books misrouting to 'selfhelp' (see
+# marker-vs-docling eval). Models are heavy (~5GB VRAM); load once per process.
+from marker.converters.pdf import PdfConverter
+from marker.models import create_model_dict
+from marker.output import text_from_rendered
 
 # ebooklib — pip install ebooklib
 import ebooklib
@@ -133,7 +149,7 @@ class Chunk:
 class PipelineConfig:
     library_path: Path
     working_dir: Path
-    extraction_workers: int = 8
+    extraction_workers: int = 2   # GPU-bound: Marker needs ~5GB VRAM/worker
     max_concurrent_inserts: int = 4
     # Repurposed post-migration: the Ollama LLM request timeout (seconds) for the
     # curated-slice entity extraction. A single extraction call runs several seconds
@@ -173,7 +189,7 @@ def load_config(path: str | None) -> PipelineConfig:
     defaults: dict[str, Any] = {
         "library_path": os.getenv("LIBRARY_PATH", "./library"),
         "working_dir":  os.getenv("WORKING_DIR", os.getenv("LIGHTRAG_WORKING_DIR", "./lightrag_data")),
-        "extraction_workers": int(os.getenv("EXTRACTION_WORKERS", "8")),
+        "extraction_workers": int(os.getenv("EXTRACTION_WORKERS", "2")),
         "max_concurrent_inserts": int(os.getenv("MAX_CONCURRENT_INSERTS", "4")),
         "insert_timeout": int(os.getenv("INSERT_TIMEOUT", "300")),
         "embedding_model": os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
@@ -280,14 +296,30 @@ def _route_chunker(raw: str, path: Path) -> str:
 # Extraction — PDF
 # ---------------------------------------------------------------------------
 
+# Marker's model dict is expensive to build (~5GB VRAM, tens of seconds). Cache it
+# as a per-process global so every PDF a worker handles reuses one load — NEVER
+# rebuild per call. Warmed upfront by _init_extraction_worker (the Pool initializer).
+_MARKER_MODELS = None
+
+
+def _marker_models():
+    global _MARKER_MODELS
+    if _MARKER_MODELS is None:
+        _MARKER_MODELS = create_model_dict()
+    return _MARKER_MODELS
+
+
 def extract_pdf(path: Path) -> str:
     """
-    Extract clean prose from a PDF using docling.
-    Returns the full document text as a single string.
+    Extract markdown from a PDF using Marker, which renders equations as LaTeX
+    ($$...$$) — the routing signal docling dropped. Returns the document as a
+    single markdown string. GPU-bound; reuses the cached per-process model dict.
     """
-    converter = DocumentConverter()
-    result = converter.convert(str(path))
-    return result.document.export_to_markdown()
+    converter = PdfConverter(artifact_dict=_marker_models())
+    rendered = converter(str(path))
+    out = text_from_rendered(rendered)
+    # text_from_rendered returns (text, <meta-or-ext>, images) across versions.
+    return out[0] if isinstance(out, tuple) else out
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +457,16 @@ def apply_content_rules(raw: str, path: Path) -> list[Chunk]:
 # ---------------------------------------------------------------------------
 # Top-level extraction (called inside multiprocessing.Pool.map)
 # ---------------------------------------------------------------------------
+
+def _init_extraction_worker() -> None:
+    """Pool initializer — warm Marker's model dict once per worker process.
+
+    Loading upfront (rather than lazily on the first PDF) makes the ~5GB VRAM /
+    tens-of-seconds cost predictable and fails fast if the models can't load
+    (e.g. VRAM exhausted) instead of surfacing mid-run as a dropped document.
+    """
+    _marker_models()
+
 
 def extract_document(path: Path) -> tuple[str, list[Chunk]]:
     """
@@ -714,15 +756,17 @@ def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: b
             logger.warning(f"No PDF/EPUB files found under {config.library_path}")
             return
 
-        # Parallel extraction (CPU-bound → multiprocessing).
-        # NOTE: worker count is capped well below cpu_count() — each worker runs a full
-        # docling+EasyOCR pipeline that can need several GB for large PDFs, so a high
-        # process count risks OOM (workers silently drop documents via MemoryError,
-        # producing a near-empty result set instead of a clean failure).
+        # Parallel extraction (GPU-bound for PDF → multiprocessing).
+        # NOTE: worker count is capped by GPU VRAM, not CPU — each worker loads its own
+        # copy of Marker's surya models (~5GB VRAM/worker) via _init_extraction_worker.
+        # On a 16GB card 2 workers (~10GB) is safe; a high process count OOMs the GPU
+        # (workers silently drop documents, producing a near-empty result set instead
+        # of a clean failure). Tune with EXTRACTION_WORKERS.
         logger.info(f"Extracting {len(files)} documents using {config.extraction_workers} workers...")
         all_chunks: list[Chunk] = []
         with stage("extraction", n_files=len(files)):
-            with make_progress() as progress, Pool(processes=config.extraction_workers) as pool:
+            with make_progress() as progress, \
+                    Pool(processes=config.extraction_workers, initializer=_init_extraction_worker) as pool:
                 task = progress.add_task("Extracting documents", total=len(files))
                 for name, doc_chunks in pool.imap_unordered(extract_document, files):
                     all_chunks.extend(doc_chunks)

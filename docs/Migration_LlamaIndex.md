@@ -4,8 +4,10 @@ Working migration plan for moving the KathanaKnowledgeBase RAG off LightRAG + cu
 SurrealDB onto LlamaIndex's `PropertyGraphIndex`. Written against the actual
 `chunks_checkpoint.json` (4648 chunks, 7 source files) and two representative notes.
 
-Status: design / not yet implemented. The delete-verify harness (§7) is the
-load-bearing risk and should be validated before building on the rest.
+Status: design / partially implemented. The delete-verify harness (§7) — the
+load-bearing risk — has been validated: the gate **FAILED** and **Fallback #2
+(note-namespace rebuild) is adopted** (see §7 Resolution, 2026-07-07). Book
+ingestion (§5) is the current implementation target.
 
 ---
 
@@ -336,6 +338,56 @@ def test_delete_completeness(graph_store, index):
   2. Note-subgraph rebuild — since notes are cheap (no LLM extraction), rebuild the
      entire *note* namespace on each update cycle; the book graph is untouched.
 
+### Resolution (2026-07-07): gate FAILED → Fallback #2 adopted
+
+Built and ran the harness against the live local Neo4j (`llamaindex` DB,
+`neo4j://127.0.0.1:7687`). Files: `test_delete_completeness.py` (the gate) and
+`test_note_rebuild.py` (the fallback validation).
+
+**Gate result: FAIL.** `index.delete_ref_doc(ref_doc_id, delete_from_docstore=True)`
+only purges nodes tracked in the index's *docstore* — the body `TextNode` inserted via
+`index.insert_nodes()` with a `SOURCE` relationship. It is **blind to anything written
+directly through `property_graph_store.upsert_nodes()` / `upsert_relations()`**, which
+is exactly the `EntityNode`/`Relation` structure the §6 note ingester writes. After a
+delete-then-reinsert (ALPHA→BETA), the old `ALPHA` `EntityNode` and its
+`(Concept X)-[RELATES_TO]->(ALPHA)` edge survived as orphans — even though the edge
+carried a `ref_doc_id` property. Only the docstore chunk was removed.
+
+**Adopted: Fallback #2 (note-namespace rebuild)** — validated by `test_note_rebuild.py`
+(RESULT: PASS). To update any note, purge the whole note namespace from the graph store,
+then re-ingest:
+
+```cypher
+MATCH (n)
+WHERE n.source_type = 'note'
+   OR n.id STARTS WITH 'note::'
+   OR n.ref_doc_id STARTS WITH 'note::'
+DETACH DELETE n
+```
+
+The `note::` id/ref_doc_id clauses are load-bearing: LlamaIndex creates a bare `SOURCE`
+doc-node that carries *no* `source_type` property of its own, so `source_type='note'`
+alone would miss it. A `source_type='book'` control node mentioning the same term was
+confirmed to SURVIVE the rebuild — the purge never touches the (expensive) book graph.
+
+**Fallback #1 (manual purge by `ref_doc_id`) rejected:** the wikilink-target concept
+nodes (e.g. `ALPHA`) are intentionally *not* stamped with a `ref_doc_id` (they're shared
+across notes), so a ref_doc_id-scoped purge would need an extra orphan-pruning pass.
+Rebuild is correct-by-construction and cheap, so it wins.
+
+**Consequences for the rest of the build:**
+- §6's note-update primitive is `rebuild_note_namespace()` (purge note namespace +
+  re-ingest all notes), NOT `delete_ref_doc()`. `delete_ref_doc` may still tidy the
+  docstore side, but graph-store cleanup must be the explicit namespace purge above.
+- `ref_doc_id` is a **read-only property** in llama-index 0.14.x (no setter). The §4/§5
+  sketches showing `node.ref_doc_id = doc_id` will `AttributeError` — set the `SOURCE`
+  relationship instead: `node.relationships[NodeRelationship.SOURCE] =
+  RelatedNodeInfo(node_id=doc_id)`.
+- `PropertyGraphIndex.from_existing()` with no `kg_extractors` (or `[]`) falls back to
+  an OpenAI-backed `SimpleLLMPathExtractor` and errors without `llama-index-llms-openai`.
+  Pass an explicit extractor list (LLM-free `ImplicitPathExtractor` for the note/embed
+  paths).
+
 ---
 
 ## 8. GraphNotes query interface (later)
@@ -473,8 +525,8 @@ matters enough that day-plus-per-run is intolerable.
 
 ## 13. Suggested order of work
 
-1. **Delete-verify harness (§7)** — gate. Prove note updates purge cleanly against
-   `Neo4jPropertyGraphStore` specifically (§11).
+1. **Delete-verify harness (§7)** — gate. ✅ DONE (2026-07-07): gate FAILED,
+   Fallback #2 (note-namespace rebuild) validated and adopted. See §7 Resolution.
 2. Content-based classification fix (§2.1) — so `content_type` is trustworthy.
 3. Define the curated hybrid slice (§3, §11) — which books (or chapters) get full
    `kg_extractors` treatment vs. embeddings-only.
