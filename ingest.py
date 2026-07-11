@@ -39,7 +39,7 @@ from dataclasses import dataclass, field, asdict, fields, MISSING
 from datetime import datetime
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from bs4 import BeautifulSoup
@@ -77,7 +77,7 @@ from llama_index.core.schema import (
     TransformComponent,
 )
 from llama_index.core.graph_stores.types import KG_NODES_KEY, KG_RELATIONS_KEY
-from llama_index.core.indices.property_graph import SimpleLLMPathExtractor
+from llama_index.core.indices.property_graph import SimpleLLMPathExtractor, SchemaLLMPathExtractor
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
@@ -197,6 +197,14 @@ class PipelineConfig:
     # Curated-slice LLM extraction knobs (§10 — single pass, no gleaning).
     max_paths_per_chunk: int = 10
     extract_num_workers: int = 4
+    # Extractor: "schema" (SchemaLLMPathExtractor — constrained vocabulary, clean graph)
+    # or "simple" (SimpleLLMPathExtractor — free-form, noisy). See SCHEMA_ENTITIES/RELATIONS.
+    extractor: str = "schema"
+    # Strict schema mode: drop triples whose (subject_type, relation, object_type) fall
+    # outside the vocabulary. The vocabulary itself is always enforced via structured
+    # output; strict additionally prunes. Set False if the model struggles with strict
+    # structured output.
+    extract_strict: bool = True
     # Map directory name fragments → content type
     content_type_rules: dict[str, str] = field(default_factory=lambda: {
         "software": "software",
@@ -224,6 +232,7 @@ _ENV_SPEC: dict[str, tuple[list[str], Any]] = {
     "ollama_model":           (["OLLAMA_MODEL"], str),
     "extract_model":          (["EXTRACT_MODEL"], str),
     "extract_thinking":       (["EXTRACT_THINKING"], str),
+    "extractor":              (["EXTRACTOR"], str),
     "vector_dim":             (["VECTOR_DIM", "SURREALDB_VECTOR_DIM"], int),
     "neo4j_url":              (["NEO4J_URL"], str),
     "neo4j_user":             (["NEO4J_USER"], str),
@@ -968,6 +977,63 @@ def _resolve_thinking(model: str, setting: str) -> bool | None:
     return False if _is_thinking_model(model) else None
 
 
+# ---------------------------------------------------------------------------
+# Graph schema — constrained vocabulary for SchemaLLMPathExtractor
+# ---------------------------------------------------------------------------
+# Starter vocabulary for the applied-CS / software / data-science corpus. EDIT THESE:
+# they are the whole point of the schema extractor. The free-form extractor produced
+# ~2 relations per type (437 types / 855 rels on 100 chunks); a fixed vocabulary yields
+# dozens of edges per type, keeping the full-corpus graph traversable instead of a
+# hairball. PLACEHOLDER pending the Claude Chat/Cowork vocabulary consult.
+SCHEMA_ENTITIES: list[str] = [
+    "Concept", "Technique", "Technology", "DataStructure", "Principle",
+    "QualityAttribute", "Person", "Work", "Metric", "Field", "Example",
+    "Dataset", "Query", "Visualization",
+]
+SCHEMA_RELATIONS: list[str] = [
+    "IS_A", "PART_OF", "USES", "IMPLEMENTS", "SOLVES", "IMPROVES",
+    "ALTERNATIVE_TO", "CONTRASTS_WITH", "EXAMPLE_OF", "DEFINES",
+    "HAS_PROPERTY", "APPLIES_TO", "AUTHORED_BY", "RELATED_TO",
+]
+
+
+def build_kg_extractor(config: PipelineConfig, llm: Ollama):
+    """Build the curated-slice KG extractor selected by config.extractor.
+
+    "schema" (default): SchemaLLMPathExtractor constrains the LLM — via structured output
+    — to SCHEMA_ENTITIES / SCHEMA_RELATIONS. That constrained vocabulary is what keeps a
+    full-corpus graph usable. The validation schema is permissive (every entity type may
+    use every relation), so strict mode enforces the vocabulary without prematurely
+    restricting which entity types may pair.
+
+    "simple": the original free-form SimpleLLMPathExtractor (noisy; kept for comparison).
+    """
+    if config.extractor == "simple":
+        logger.info("Extractor: SimpleLLMPathExtractor (free-form)")
+        return SimpleLLMPathExtractor(
+            llm=llm,
+            max_paths_per_chunk=config.max_paths_per_chunk,
+            num_workers=config.extract_num_workers,
+        )
+
+    entities = Literal[tuple(SCHEMA_ENTITIES)]     # type: ignore[valid-type]
+    relations = Literal[tuple(SCHEMA_RELATIONS)]   # type: ignore[valid-type]
+    validation = {e: list(SCHEMA_RELATIONS) for e in SCHEMA_ENTITIES}  # permissive
+    logger.info(
+        f"Extractor: SchemaLLMPathExtractor (strict={config.extract_strict}; "
+        f"{len(SCHEMA_ENTITIES)} entity types, {len(SCHEMA_RELATIONS)} relation types)"
+    )
+    return SchemaLLMPathExtractor(
+        llm=llm,
+        possible_entities=entities,
+        possible_relations=relations,
+        kg_validation_schema=validation,
+        strict=config.extract_strict,
+        max_triplets_per_chunk=config.max_paths_per_chunk,
+        num_workers=config.extract_num_workers,
+    )
+
+
 def init_stores(config: PipelineConfig) -> Stores:
     """Connect to Neo4j and build two PropertyGraphIndex views over the SAME store
     and storage context: one runs SimpleLLMPathExtractor (curated slice), the other
@@ -1009,13 +1075,10 @@ def init_stores(config: PipelineConfig) -> Stores:
     extract_index = PropertyGraphIndex.from_existing(
         llm=llm,
         kg_extractors=[
-            SimpleLLMPathExtractor(
-                llm=llm,
-                max_paths_per_chunk=config.max_paths_per_chunk,
-                num_workers=config.extract_num_workers,
-            ),
-            # Defensive cleanup of free-form relation labels (backticks etc.) so a noisy
-            # label can't crash the batch via apoc.merge.relationship. See the class doc.
+            build_kg_extractor(config, llm),
+            # Defensive cleanup of relation labels (backticks etc.) so a noisy label
+            # can't crash the batch via apoc.merge.relationship. Harmless (no-op) for the
+            # schema extractor's clean UPPER_SNAKE relations; defends the "simple" path.
             RelationLabelSanitizer(),
         ],
         **common,
@@ -1116,7 +1179,7 @@ def preflight(config: PipelineConfig, *, check_ollama: bool, check_library: bool
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
-def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: bool = False, profile: bool = False, extract_only: bool = False, require_curated: bool = False, skip_preflight: bool = False) -> None:
+def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: bool = False, profile: bool = False, extract_only: bool = False, require_curated: bool = False, skip_preflight: bool = False, extract_all: bool = False) -> None:
     # Every run leaves an on-disk log (console logging alone is lost when the terminal
     # closes — the reason a silent overnight run once went undiagnosed).
     add_file_logging(config.working_dir)
@@ -1286,7 +1349,10 @@ def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: b
     embed_books: set[str] = set()
     for c in chunks:
         stem = Path(c.source_path).stem
-        if is_curated(c.source_path):
+        # --extract-all sends every book through LLM extraction (whole-corpus graph),
+        # bypassing the curated-slice gate. Only viable with the schema extractor —
+        # free-form extraction over the full corpus is a relation-type hairball.
+        if extract_all or is_curated(c.source_path):
             curated_chunks.append(c)
             curated_books.add(stem)
         else:
@@ -1294,7 +1360,8 @@ def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: b
             embed_books.add(stem)
 
     logger.info(
-        f"Hybrid split: {len(curated_chunks)} curated chunk(s) from {len(curated_books)} book(s) "
+        f"Hybrid split{' (--extract-all)' if extract_all else ''}: "
+        f"{len(curated_chunks)} curated chunk(s) from {len(curated_books)} book(s) "
         f"→ LLM extraction; {len(embed_chunks)} chunk(s) from {len(embed_books)} book(s) → embeddings-only"
     )
 
@@ -1375,6 +1442,12 @@ def main() -> None:
         action="store_true",
         help="Skip the Ollama-model / non-empty-library preflight checks.",
     )
+    parser.add_argument(
+        "--extract-all",
+        action="store_true",
+        help="Send EVERY book through LLM entity extraction (whole-corpus graph), "
+             "bypassing the curated-slice gate. Intended for the schema extractor.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -1387,6 +1460,7 @@ def main() -> None:
             extract_only=args.extract_only,
             require_curated=args.require_curated,
             skip_preflight=args.skip_preflight,
+            extract_all=args.extract_all,
         )
     except SystemExit:
         raise  # clean, intentional exits (preflight/guards) — already logged their reason

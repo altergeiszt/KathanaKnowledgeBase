@@ -133,6 +133,9 @@ The env↔config mapping lives in `_ENV_SPEC` in [`ingest.py`](../ingest.py). Se
 | `--from-checkpoint` | Skip phase 1; run phase 2 from the saved `chunks_checkpoint.json`. |
 | `--require-curated` | Abort (not warn) if no library book matches the curated slice (§2.2). |
 | `--skip-preflight` | Bypass the Ollama-model / non-empty-library preflight checks (§2.3). |
+| `--extract-all` | Send **every** book through LLM extraction (whole-corpus graph), bypassing the curated gate. Intended with the schema extractor. |
+
+**Extractor & schema.** `EXTRACTOR` = `schema` (default) | `simple`. `schema` uses `SchemaLLMPathExtractor` constrained to the vocabulary in `SCHEMA_ENTITIES` / `SCHEMA_RELATIONS` in [`ingest.py`](../ingest.py) — a fixed entity/relation vocabulary enforced via the LLM's structured output, which keeps the graph traversable (the free-form `simple` extractor produced ~2 relations per type; a schema yields dozens per type). Edit those two lists to tune the vocabulary; `extract_strict` (config, default true) additionally prunes off-vocabulary triples. `--extract-all` + `schema` is the intended pairing for graphing the whole corpus.
 | `--profile` | Per-stage timing via `pipeline_profiler` (if available). |
 
 `--extract-only` and `--from-checkpoint` are mutually exclusive.
