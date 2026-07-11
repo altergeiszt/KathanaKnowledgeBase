@@ -1390,6 +1390,14 @@ def main() -> None:
         )
     except SystemExit:
         raise  # clean, intentional exits (preflight/guards) — already logged their reason
+    except KeyboardInterrupt:
+        # A deliberate Ctrl+C is not a crash — log it gently (no scary traceback) and
+        # remind that the batch checkpoint means the run is resumable.
+        logger.warning(
+            "Interrupted by user (Ctrl+C). Committed batches are saved; "
+            "resume the unfinished tail with --from-checkpoint (no --reset)."
+        )
+        raise
     except BaseException:
         # Persist the fatal traceback to the file log too — an uncaught exception
         # otherwise goes only to stderr, so an overnight crash left no on-disk cause
