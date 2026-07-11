@@ -899,6 +899,32 @@ class EmbedOnlyExtractor(TransformComponent):
         return self.__call__(nodes, **kwargs)
 
 
+class RelationLabelSanitizer(TransformComponent):
+    """Clean extracted relation labels so they can't break Neo4j's relationship-type
+    syntax. `apoc.merge.relationship` INLINES the relation type into dynamically-built
+    Cypher (backtick-quoted) and does NOT escape internal backticks — so a schema-free
+    label like `` `is written as` `` (stray backticks from the LLM) prematurely closes
+    the quote and raises a SyntaxException mid-batch, crashing the whole run.
+
+    Runs AFTER SimpleLLMPathExtractor on the curated path: strips backticks and collapses
+    whitespace (newlines/tabs) in each relation label, keeping everything else so the raw
+    extraction is still faithfully represented (important for the model A/B). A constrained
+    SchemaLLMPathExtractor would make this unnecessary — this only defends the free-form path."""
+
+    def __call__(self, nodes, **kwargs):
+        for node in nodes:
+            for rel in node.metadata.get(KG_RELATIONS_KEY, []) or []:
+                label = getattr(rel, "label", None)
+                if not label:
+                    continue
+                safe = " ".join(label.replace("`", "").split()).strip()
+                rel.label = safe or "RELATED_TO"
+        return nodes
+
+    async def acall(self, nodes, **kwargs):
+        return self.__call__(nodes, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Neo4j PropertyGraphIndex setup (§5, §11)
 # ---------------------------------------------------------------------------
@@ -982,11 +1008,16 @@ def init_stores(config: PipelineConfig) -> Stores:
     )
     extract_index = PropertyGraphIndex.from_existing(
         llm=llm,
-        kg_extractors=[SimpleLLMPathExtractor(
-            llm=llm,
-            max_paths_per_chunk=config.max_paths_per_chunk,
-            num_workers=config.extract_num_workers,
-        )],
+        kg_extractors=[
+            SimpleLLMPathExtractor(
+                llm=llm,
+                max_paths_per_chunk=config.max_paths_per_chunk,
+                num_workers=config.extract_num_workers,
+            ),
+            # Defensive cleanup of free-form relation labels (backticks etc.) so a noisy
+            # label can't crash the batch via apoc.merge.relationship. See the class doc.
+            RelationLabelSanitizer(),
+        ],
         **common,
     )
     embed_index = PropertyGraphIndex.from_existing(
