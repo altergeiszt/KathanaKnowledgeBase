@@ -612,12 +612,12 @@ def load_raw_book(source: str | Path, config: PipelineConfig) -> list[Chunk] | N
     try:
         with open(path, encoding="utf-8") as f:
             payload = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None  # corrupt / half-written → re-parse
-    src = Path(source)
-    if src.exists() and payload.get("fingerprint") != _file_fingerprint(src):
-        return None
-    return [Chunk(**c) for c in payload["chunks"]]
+        src = Path(source)
+        if src.exists() and payload.get("fingerprint") != _file_fingerprint(src):
+            return None
+        return [Chunk(**c) for c in payload["chunks"]]
+    except (json.JSONDecodeError, OSError, KeyError, TypeError, AttributeError):
+        return None  # corrupt / half-written / malformed → re-parse
 
 
 # ---------------------------------------------------------------------------
