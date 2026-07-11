@@ -687,13 +687,23 @@ def reset_book_namespace(graph_store: Neo4jPropertyGraphStore) -> None:
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
-def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: bool = False, profile: bool = False) -> None:
-    # Stage 1: connect to Neo4j and build the two index views.
-    stores = init_stores(config)
+def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: bool = False, profile: bool = False, extract_only: bool = False) -> None:
+    # --extract-only and --from-checkpoint are opposite halves of the split run and
+    # cannot both apply: one does extraction-then-stop, the other skips extraction.
+    if extract_only and from_checkpoint:
+        logger.warning("--extract-only and --from-checkpoint are mutually exclusive; ignoring --from-checkpoint")
+        from_checkpoint = False
+
+    # Stage 1: connect to Neo4j and build the two index views. --extract-only stops
+    # before insertion, so it needs no DB connection at all (Neo4j need not be up).
+    stores = None if extract_only else init_stores(config)
 
     # Stage 0: (optional) purge the book namespace before re-ingesting.
     if reset:
-        reset_book_namespace(stores.graph_store)
+        if extract_only:
+            logger.warning("--reset has no effect with --extract-only (no DB is touched); ignoring")
+        else:
+            reset_book_namespace(stores.graph_store)
 
     if profile and Profiler is None:
         logger.warning("--profile requested but pipeline_profiler is unavailable (archived); continuing without profiling")
@@ -742,6 +752,15 @@ def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: b
 
         # Checkpoint: persist the post-dedup chunk list before insertion begins
         save_chunks_checkpoint(chunks, config)
+
+    # --extract-only: chunks are now parsed, deduped, and on disk. Stop before the
+    # embed/insert half — resume it later (e.g. another night) with --from-checkpoint.
+    if extract_only:
+        logger.info(f"Extract-only complete: {len(chunks)} chunks checkpointed to "
+                    f"{checkpoint_path(config)}; stopping before embedding/insertion.")
+        if profiler:
+            profiler.report()
+        return
 
     # Stage 5: hybrid node build + insertion (§5).
     # Split chunks by curated-slice membership: curated books get full LLM entity
@@ -793,6 +812,12 @@ def main() -> None:
         help="Skip discovery/extraction/dedup and reuse the last saved chunks_checkpoint.json",
     )
     parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="Parse + dedup + write chunks_checkpoint.json, then stop before embedding/insertion "
+             "(no Neo4j needed). Resume the insert half later with --from-checkpoint.",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Enable per-stage timing via pipeline_profiler (writes to working_dir/profile_results)",
@@ -805,6 +830,7 @@ def main() -> None:
         reset=args.reset,
         from_checkpoint=args.from_checkpoint,
         profile=args.profile,
+        extract_only=args.extract_only,
     )
 
 
