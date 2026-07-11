@@ -1084,6 +1084,8 @@ class SurrealDBDocStatusStorage(BaseDocStatusStorage):
 
 ## 2. Ingestion Pipeline — `ingest.py`
 
+> 📌 **Operational safeguards (crash resilience, preflight, idempotency, logging) are documented separately in [`Ingestion_Safeguards.md`](Ingestion_Safeguards.md), which is authoritative for the current LlamaIndex/Neo4j pipeline.** The listing in this section is SurrealDB-era and retained for design intent only.
+
 Orchestrates file discovery, parallel extraction, deduplication, and LightRAG insertion. Run with:
 
 ```bash

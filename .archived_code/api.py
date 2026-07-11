@@ -1,3 +1,17 @@
+# =============================================================================
+# ⚠️ ARCHIVED — LightRAG/SurrealDB era, NON-FUNCTIONAL. Do not run.
+#
+# This was the query/serving bridge for the pre-migration stack. It no longer
+# imports (`from ingest import make_embedding_func` was removed in the migration)
+# and targets LightRAG + the SurrealDB storage adapter, both retired in the move
+# to LlamaIndex + Neo4j.
+#
+# Kept as a REFERENCE for the eventual query interface — see Migration_LlamaIndex.md
+# §8 "GraphNotes query interface (later)". That rewrite mirrors this file's role
+# (OpenWebUI-compatible endpoints, NDJSON streaming, conversation history, Ollama/
+# Anthropic provider routing) but replaces the retrieval guts with PropertyGraphIndex
+# retrievers (LLMSynonymRetriever / VectorContextRetriever / graph traversal) over Neo4j.
+# =============================================================================
 """
 api.py
 
