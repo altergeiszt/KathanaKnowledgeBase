@@ -112,10 +112,20 @@ def add_file_logging(working_dir: Path) -> Path:
     log_dir = working_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"ingest_{datetime.now():%Y%m%d_%H%M%S}.log"
+    root_logger = logging.getLogger()
+    # Drop any FileHandler from a prior call in this process (tests, repeated runs) so
+    # log records aren't duplicated across files. Close each to release the file handle.
+    for h in list(root_logger.handlers):
+        if isinstance(h, logging.FileHandler):
+            root_logger.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
     handler = logging.FileHandler(log_path, encoding="utf-8")
     handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logging.getLogger().addHandler(handler)
+    root_logger.addHandler(handler)
     logger.info(f"Logging to {log_path}")
     return log_path
 
@@ -247,7 +257,14 @@ def load_config(path: str | None) -> PipelineConfig:
     file_cfg: dict[str, Any] = {}
     if path and Path(path).exists():
         with open(path) as f:
-            file_cfg = yaml.safe_load(f) or {}
+            loaded = yaml.safe_load(f)
+        if isinstance(loaded, dict):
+            file_cfg = loaded
+        elif loaded is not None:
+            # empty file (None) is fine → use defaults; a list/scalar is a config error.
+            logger.warning(
+                f"config.yaml at {path} is not a YAML mapping ({type(loaded).__name__}); ignoring it"
+            )
     for k, v in file_cfg.items():
         if k in known:
             resolved[k] = v
@@ -257,14 +274,16 @@ def load_config(path: str | None) -> PipelineConfig:
     # Layer 3 — environment / .env, only for vars actually present. Warn loudly when an
     # env var overrides a DIFFERENT config.yaml value so the conflict is never silent.
     for key, (env_names, parser) in _ENV_SPEC.items():
-        raw = next((os.environ[n] for n in env_names if n in os.environ), None)
-        if raw is None:
+        # Track WHICH env var was actually set (env_names may list fallbacks, e.g.
+        # WORKING_DIR / LIGHTRAG_WORKING_DIR) so the conflict message names the real one.
+        used = next((n for n in env_names if n in os.environ), None)
+        if used is None:
             continue
-        val = parser(raw)
+        val = parser(os.environ[used])
         if key in file_cfg and str(file_cfg[key]) != str(val):
             logger.warning(
                 f"Config conflict on '{key}': config.yaml={file_cfg[key]!r} overridden by "
-                f"env {env_names[0]}={val!r} (env wins)."
+                f"env {used}={val!r} (env wins)."
             )
         resolved[key] = val
 
@@ -552,11 +571,17 @@ def deduplicate(chunks: list[Chunk], threshold: float = 0.85, num_perm: int = 12
 def _atomic_write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        # A non-serializable obj or a failed replace would otherwise leave an orphaned
+        # .tmp behind; remove it (best-effort) and re-raise the original error.
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +605,10 @@ def _file_fingerprint(path: Path) -> str:
 
 
 def raw_cache_path(config: PipelineConfig, source: str | Path) -> Path:
+    # Keyed by filename stem. This assumes stems are unique across the library — an
+    # invariant the library is hand-curated to guarantee (one file per stem, no
+    # same-named files in different subdirectories). Two files sharing a stem would
+    # collide here and mix/overwrite each other's cached chunks.
     return raw_cache_dir(config) / f"{Path(source).stem}.json"
 
 
@@ -612,12 +641,12 @@ def load_raw_book(source: str | Path, config: PipelineConfig) -> list[Chunk] | N
     try:
         with open(path, encoding="utf-8") as f:
             payload = json.load(f)
-        src = Path(source)
-        if src.exists() and payload.get("fingerprint") != _file_fingerprint(src):
-            return None
-        return [Chunk(**c) for c in payload["chunks"]]
-    except (json.JSONDecodeError, OSError, KeyError, TypeError, AttributeError):
-        return None  # corrupt / half-written / malformed → re-parse
+    except (json.JSONDecodeError, OSError):
+        return None  # corrupt / half-written → re-parse
+    src = Path(source)
+    if src.exists() and payload.get("fingerprint") != _file_fingerprint(src):
+        return None
+    return [Chunk(**c) for c in payload["chunks"]]
 
 
 # ---------------------------------------------------------------------------
@@ -691,16 +720,17 @@ def load_extract_progress(config: PipelineConfig) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+        if data.get("fingerprint") != fresh["fingerprint"]:
+            logger.warning("extract_progress.json is stale (checkpoint changed); ignoring it")
+            return fresh
+        return {
+            "fingerprint": data["fingerprint"],
+            "embed": set(data.get("embed", [])),
+            "curated": set(data.get("curated", [])),
+        }
+    except (json.JSONDecodeError, OSError, KeyError, TypeError, AttributeError):
+        # Corrupt / half-written / wrong-shaped (e.g. a JSON list) → start fresh.
         return fresh
-    if data.get("fingerprint") != fresh["fingerprint"]:
-        logger.warning("extract_progress.json is stale (checkpoint changed); ignoring it")
-        return fresh
-    return {
-        "fingerprint": data["fingerprint"],
-        "embed": set(data.get("embed", [])),
-        "curated": set(data.get("curated", [])),
-    }
 
 
 def save_extract_progress(progress: dict, config: PipelineConfig) -> None:
@@ -993,12 +1023,15 @@ def _check_ollama(config: PipelineConfig) -> None:
     try:
         with urllib.request.urlopen(tags_url, timeout=5) as resp:
             payload = json.load(resp)
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        # Parse inside the try: a malformed host raises ValueError from urlopen, and an
+        # unexpected payload shape raises AttributeError/TypeError here — all should
+        # surface as a clean SystemExit, not an unhandled crash.
+        names = {m.get("name", "") for m in payload.get("models", [])}
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError, AttributeError, TypeError) as exc:
         raise SystemExit(
-            f"Preflight: Ollama unreachable at {config.ollama_host} ({exc}). "
+            f"Preflight: Ollama unreachable or returned an invalid response at {config.ollama_host} ({exc}). "
             f"Start it (`ollama serve`) or set OLLAMA_HOST. Use --skip-preflight to bypass."
         )
-    names = {m.get("name", "") for m in payload.get("models", [])}
     # Ollama tags carry a ':tag' suffix; accept an exact match or a bare-name match.
     bare = {n.split(":", 1)[0] for n in names}
     # Check the EXTRACTION model — that's the one the insert half actually calls.
@@ -1040,7 +1073,9 @@ def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: b
     # the file log), not silently inferred from bad results later.
     logger.info(
         f"Effective config: library_path={config.library_path} | working_dir={config.working_dir} "
-        f"| neo4j_db={config.neo4j_database} @ {config.neo4j_url} | ollama_model={config.ollama_model}"
+        f"| neo4j_db={config.neo4j_database} @ {config.neo4j_url} "
+        f"| extract_model={config.extract_model} (thinking={config.extract_thinking}) "
+        f"| ollama_model={config.ollama_model}"
     )
 
     # --extract-only and --from-checkpoint are opposite halves of the split run and
