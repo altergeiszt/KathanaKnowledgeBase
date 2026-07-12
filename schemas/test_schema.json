@@ -1,0 +1,27 @@
+{
+  "entity_types": [
+    {"type": "Concept",      "definition": "A general idea or object of study.", "examples": ["vector space", "linear transformation", "polymorphism"]},
+    {"type": "Theorem",      "definition": "A proven mathematical statement.", "examples": ["rank-nullity theorem"]},
+    {"type": "Definition",   "definition": "A formal definition of a term.", "examples": ["invertible linear transformation"]},
+    {"type": "Method",       "definition": "A procedure or technique.", "examples": ["matrix multiplication", "Gaussian elimination"]},
+    {"type": "Notation",     "definition": "A symbol or notational convention.", "examples": ["archetype label"]},
+    {"type": "DesignPattern","definition": "A reusable software design pattern.", "examples": ["factory method", "visitor", "singleton"]},
+    {"type": "Class",        "definition": "A code class/object in an example.", "examples": ["Employee class", "command object"]},
+    {"type": "Person",       "definition": "An author or named figure.", "examples": ["Rob Beezer"]},
+    {"type": "Work",         "definition": "A referenced book/paper.", "examples": ["A First Course in Linear Algebra"]},
+    {"type": "Example",      "definition": "A worked example or archetype.", "examples": ["linear algebra archetype"]}
+  ],
+  "relation_types": [
+    {"type": "DEFINES",     "definition": "Subject gives the meaning of the object.", "example": "Definition DEFINES Concept"},
+    {"type": "PROVES",      "definition": "Subject establishes the object.", "example": "Theorem PROVES Concept"},
+    {"type": "DEPENDS_ON",  "definition": "Subject requires the object.", "example": "Theorem DEPENDS_ON Definition"},
+    {"type": "IS_A",        "definition": "Subject is a kind of object.", "example": "Concept IS_A Concept"},
+    {"type": "PART_OF",     "definition": "Subject is a component of object.", "example": "Method PART_OF Concept"},
+    {"type": "EXAMPLE_OF",  "definition": "Subject illustrates object.", "example": "Example EXAMPLE_OF Concept"},
+    {"type": "IMPLEMENTS",  "definition": "Subject realizes object in code.", "example": "Class IMPLEMENTS DesignPattern"},
+    {"type": "USES",        "definition": "Subject employs object.", "example": "DesignPattern USES Class"},
+    {"type": "GENERALIZES", "definition": "Subject is a broader form of object.", "example": "Concept GENERALIZES Concept"},
+    {"type": "AUTHORED_BY", "definition": "Work written by Person.", "example": "Work AUTHORED_BY Person"},
+    {"type": "RELATED_TO",  "definition": "Catch-all association.", "example": "Concept RELATED_TO Concept"}
+  ]
+}

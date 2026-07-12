@@ -205,6 +205,9 @@ class PipelineConfig:
     # output; strict additionally prunes. Set False if the model struggles with strict
     # structured output.
     extract_strict: bool = True
+    # Path to a schema JSON ({"entity_types":[{"type":...}], "relation_types":[{"type":...}]}).
+    # Empty → the built-in SCHEMA_ENTITIES/SCHEMA_RELATIONS fallback. See schemas/.
+    schema_path: str = ""
     # Map directory name fragments → content type
     content_type_rules: dict[str, str] = field(default_factory=lambda: {
         "software": "software",
@@ -233,6 +236,7 @@ _ENV_SPEC: dict[str, tuple[list[str], Any]] = {
     "extract_model":          (["EXTRACT_MODEL"], str),
     "extract_thinking":       (["EXTRACT_THINKING"], str),
     "extractor":              (["EXTRACTOR"], str),
+    "schema_path":            (["SCHEMA_PATH"], str),
     "vector_dim":             (["VECTOR_DIM", "SURREALDB_VECTOR_DIM"], int),
     "neo4j_url":              (["NEO4J_URL"], str),
     "neo4j_user":             (["NEO4J_USER"], str),
@@ -980,11 +984,13 @@ def _resolve_thinking(model: str, setting: str) -> bool | None:
 # ---------------------------------------------------------------------------
 # Graph schema — constrained vocabulary for SchemaLLMPathExtractor
 # ---------------------------------------------------------------------------
-# Starter vocabulary for the applied-CS / software / data-science corpus. EDIT THESE:
-# they are the whole point of the schema extractor. The free-form extractor produced
-# ~2 relations per type (437 types / 855 rels on 100 chunks); a fixed vocabulary yields
-# dozens of edges per type, keeping the full-corpus graph traversable instead of a
-# hairball. PLACEHOLDER pending the Claude Chat/Cowork vocabulary consult.
+# The schema is normally loaded from a JSON file (config.schema_path / SCHEMA_PATH) with
+# shape {"entity_types":[{"type":...}], "relation_types":[{"type":...}]} — see
+# schemas/ and docs/Schema_Vocabulary_Handoff.md. These built-in lists are only the
+# FALLBACK used when no schema_path is set. The constrained vocabulary is the whole point:
+# the free-form extractor produced ~2 relations per type (437 types / 855 rels on 100
+# chunks); a fixed vocabulary yields dozens of edges per type, keeping the full-corpus
+# graph traversable instead of a hairball.
 SCHEMA_ENTITIES: list[str] = [
     "Concept", "Technique", "Technology", "DataStructure", "Principle",
     "QualityAttribute", "Person", "Work", "Metric", "Field", "Example",
@@ -997,14 +1003,37 @@ SCHEMA_RELATIONS: list[str] = [
 ]
 
 
+def load_schema(config: PipelineConfig) -> tuple[list[str], list[str]]:
+    """Return (entity_types, relation_types). From config.schema_path (a JSON file with
+    'entity_types'/'relation_types' lists of {'type': ...} objects) if set, else the
+    built-in SCHEMA_ENTITIES / SCHEMA_RELATIONS fallback."""
+    if not config.schema_path:
+        return list(SCHEMA_ENTITIES), list(SCHEMA_RELATIONS)
+    path = Path(config.schema_path)
+    if not path.exists():
+        raise SystemExit(f"schema_path does not exist: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entities = [e["type"] for e in data["entity_types"]]
+        relations = [r["type"] for r in data["relation_types"]]
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as exc:
+        raise SystemExit(
+            f"schema_path {path} is malformed ({exc}); expected "
+            "{'entity_types':[{'type':...}], 'relation_types':[{'type':...}]}"
+        )
+    if not entities or not relations:
+        raise SystemExit(f"schema_path {path}: entity_types and relation_types must be non-empty")
+    return entities, relations
+
+
 def build_kg_extractor(config: PipelineConfig, llm: Ollama):
     """Build the curated-slice KG extractor selected by config.extractor.
 
-    "schema" (default): SchemaLLMPathExtractor constrains the LLM — via structured output
-    — to SCHEMA_ENTITIES / SCHEMA_RELATIONS. That constrained vocabulary is what keeps a
-    full-corpus graph usable. The validation schema is permissive (every entity type may
-    use every relation), so strict mode enforces the vocabulary without prematurely
-    restricting which entity types may pair.
+    "schema" (default): SchemaLLMPathExtractor constrains the LLM — via structured output —
+    to the entity/relation types from load_schema(). That constrained vocabulary is what
+    keeps a full-corpus graph usable. The validation schema is permissive (every entity
+    type may use every relation), so strict mode enforces the vocabulary without
+    prematurely restricting which entity types may pair.
 
     "simple": the original free-form SimpleLLMPathExtractor (noisy; kept for comparison).
     """
@@ -1016,12 +1045,14 @@ def build_kg_extractor(config: PipelineConfig, llm: Ollama):
             num_workers=config.extract_num_workers,
         )
 
-    entities = Literal[tuple(SCHEMA_ENTITIES)]     # type: ignore[valid-type]
-    relations = Literal[tuple(SCHEMA_RELATIONS)]   # type: ignore[valid-type]
-    validation = {e: list(SCHEMA_RELATIONS) for e in SCHEMA_ENTITIES}  # permissive
+    entity_types, relation_types = load_schema(config)
+    entities = Literal[tuple(entity_types)]     # type: ignore[valid-type]
+    relations = Literal[tuple(relation_types)]  # type: ignore[valid-type]
+    validation = {e: list(relation_types) for e in entity_types}  # permissive
+    src = Path(config.schema_path).name if config.schema_path else "built-in"
     logger.info(
         f"Extractor: SchemaLLMPathExtractor (strict={config.extract_strict}; "
-        f"{len(SCHEMA_ENTITIES)} entity types, {len(SCHEMA_RELATIONS)} relation types)"
+        f"{len(entity_types)} entity types, {len(relation_types)} relation types; schema={src})"
     )
     return SchemaLLMPathExtractor(
         llm=llm,
