@@ -221,6 +221,10 @@ class PipelineConfig:
     })
 
 
+def _env_bool(v: str) -> bool:
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
 # Config key -> (environment variable name(s), parser). Multiple names = fallbacks,
 # first-set wins. Keys NOT listed here (dedup_*, chunk_max_chars, content_type_rules)
 # are configurable via config.yaml only — they have no env override.
@@ -237,6 +241,7 @@ _ENV_SPEC: dict[str, tuple[list[str], Any]] = {
     "extract_thinking":       (["EXTRACT_THINKING"], str),
     "extractor":              (["EXTRACTOR"], str),
     "schema_path":            (["SCHEMA_PATH"], str),
+    "extract_strict":         (["EXTRACT_STRICT"], _env_bool),
     "vector_dim":             (["VECTOR_DIM", "SURREALDB_VECTOR_DIM"], int),
     "neo4j_url":              (["NEO4J_URL"], str),
     "neo4j_user":             (["NEO4J_USER"], str),
