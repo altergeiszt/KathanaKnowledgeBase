@@ -41,6 +41,9 @@ from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
+from pydantic import PrivateAttr
+
 import yaml
 from bs4 import BeautifulSoup
 from datasketch import MinHash, MinHashLSH
@@ -208,6 +211,13 @@ class PipelineConfig:
     # Path to a schema JSON ({"entity_types":[{"type":...}], "relation_types":[{"type":...}]}).
     # Empty → the built-in SCHEMA_ENTITIES/SCHEMA_RELATIONS fallback. See schemas/.
     schema_path: str = ""
+    # Canonicalize free-form relation labels to the schema's relation vocabulary via
+    # embedding similarity (local models can't self-constrain via structured output).
+    # True → RelationCanonicalizer; False → RelationLabelSanitizer (backtick cleanup only).
+    canonicalize: bool = True
+    # Cosine-similarity floor for snapping a relation label to a schema type; below it,
+    # the label falls back to RELATED_TO (or the last schema relation).
+    canon_threshold: float = 0.45
     # Map directory name fragments → content type
     content_type_rules: dict[str, str] = field(default_factory=lambda: {
         "software": "software",
@@ -242,6 +252,7 @@ _ENV_SPEC: dict[str, tuple[list[str], Any]] = {
     "extractor":              (["EXTRACTOR"], str),
     "schema_path":            (["SCHEMA_PATH"], str),
     "extract_strict":         (["EXTRACT_STRICT"], _env_bool),
+    "canonicalize":           (["CANONICALIZE"], _env_bool),
     "vector_dim":             (["VECTOR_DIM", "SURREALDB_VECTOR_DIM"], int),
     "neo4j_url":              (["NEO4J_URL"], str),
     "neo4j_user":             (["NEO4J_USER"], str),
@@ -917,6 +928,62 @@ class EmbedOnlyExtractor(TransformComponent):
         return self.__call__(nodes, **kwargs)
 
 
+class RelationCanonicalizer(TransformComponent):
+    """Snap free-form relation labels to a fixed vocabulary by embedding similarity.
+
+    Local models over Ollama can't self-constrain their relation vocabulary: schema
+    strict mode returns empty, non-strict is ignored (see docs). So we extract free-form
+    (which works) and canonicalize HERE — embed each extracted relation label, cosine-
+    compare to the schema's relation types, and snap to the nearest above `threshold`
+    (else the RELATED_TO catch-all). Reuses the pipeline's embedding model (no extra LLM
+    cost), also strips backticks (apoc.merge.relationship safety), and caches by label."""
+
+    threshold: float = 0.45
+    _types: list = PrivateAttr(default_factory=list)
+    _fallback: str = PrivateAttr(default="RELATED_TO")
+    _vecs: Any = PrivateAttr(default=None)           # (n_types, dim) L2-normalized
+    _embed: Any = PrivateAttr(default=None)
+    _cache: dict = PrivateAttr(default_factory=dict)
+
+    def __init__(self, relation_types, embed_texts, embed_model, threshold: float = 0.45, **kwargs):
+        super().__init__(threshold=threshold, **kwargs)
+        self._types = list(relation_types)
+        self._embed = embed_model
+        self._fallback = "RELATED_TO" if "RELATED_TO" in self._types else self._types[-1]
+        vecs = np.asarray(embed_model.get_text_embedding_batch(list(embed_texts)), dtype=float)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self._vecs = vecs / norms
+        # Seed the cache so exact-vocabulary labels short-circuit to themselves.
+        for t in self._types:
+            self._cache[t.upper().replace(" ", "_")] = t
+
+    def _canon(self, label: str) -> str:
+        clean = " ".join(label.replace("`", "").split()).strip()
+        if not clean:
+            return self._fallback
+        key = clean.upper().replace(" ", "_")
+        if key in self._cache:
+            return self._cache[key]
+        v = np.asarray(self._embed.get_text_embedding(clean.replace("_", " ").lower()), dtype=float)
+        n = np.linalg.norm(v) or 1.0
+        sims = self._vecs @ (v / n)
+        best = int(sims.argmax())
+        result = self._types[best] if sims[best] >= self.threshold else self._fallback
+        self._cache[key] = result
+        return result
+
+    def __call__(self, nodes, **kwargs):
+        for node in nodes:
+            for rel in node.metadata.get(KG_RELATIONS_KEY, []) or []:
+                if getattr(rel, "label", None):
+                    rel.label = self._canon(rel.label)
+        return nodes
+
+    async def acall(self, nodes, **kwargs):
+        return self.__call__(nodes, **kwargs)
+
+
 class RelationLabelSanitizer(TransformComponent):
     """Clean extracted relation labels so they can't break Neo4j's relationship-type
     syntax. `apoc.merge.relationship` INLINES the relation type into dynamically-built
@@ -1031,6 +1098,25 @@ def load_schema(config: PipelineConfig) -> tuple[list[str], list[str]]:
     return entities, relations
 
 
+def load_relation_vocab(config: PipelineConfig) -> tuple[list[str], list[str]]:
+    """Return (relation_types, embed_texts) for the RelationCanonicalizer. embed_texts[i]
+    is 'type words: definition' (richer signal for embedding matching) when the schema
+    JSON provides definitions, else just the type name. Falls back to the built-in
+    SCHEMA_RELATIONS when no schema_path is set."""
+    if not config.schema_path:
+        return list(SCHEMA_RELATIONS), [t.replace("_", " ").lower() for t in SCHEMA_RELATIONS]
+    # schema_path is already validated by load_schema() before this runs.
+    data = json.loads(Path(config.schema_path).read_text(encoding="utf-8"))
+    types, texts = [], []
+    for r in data["relation_types"]:
+        t = r["type"]
+        d = (r.get("definition") or "").strip()
+        types.append(t)
+        words = t.replace("_", " ").lower()
+        texts.append(f"{words}: {d}" if d else words)
+    return types, texts
+
+
 def build_kg_extractor(config: PipelineConfig, llm: Ollama):
     """Build the curated-slice KG extractor selected by config.extractor.
 
@@ -1108,15 +1194,21 @@ def init_stores(config: PipelineConfig) -> Stores:
         storage_context=storage,
         show_progress=True,
     )
+    # Relation post-processor: canonicalize free-form labels to the schema vocabulary
+    # (the reliable path — local models can't self-constrain), or just sanitize backticks.
+    if config.canonicalize:
+        rel_types, rel_texts = load_relation_vocab(config)
+        post = RelationCanonicalizer(rel_types, rel_texts, embed, threshold=config.canon_threshold)
+        logger.info(
+            f"Relation canonicalizer: snapping to {len(rel_types)} schema relation type(s) "
+            f"(threshold={config.canon_threshold})"
+        )
+    else:
+        post = RelationLabelSanitizer()
+        logger.info("Relation post-processing: sanitize only (canonicalize=false)")
     extract_index = PropertyGraphIndex.from_existing(
         llm=llm,
-        kg_extractors=[
-            build_kg_extractor(config, llm),
-            # Defensive cleanup of relation labels (backticks etc.) so a noisy label
-            # can't crash the batch via apoc.merge.relationship. Harmless (no-op) for the
-            # schema extractor's clean UPPER_SNAKE relations; defends the "simple" path.
-            RelationLabelSanitizer(),
-        ],
+        kg_extractors=[build_kg_extractor(config, llm), post],
         **common,
     )
     embed_index = PropertyGraphIndex.from_existing(
