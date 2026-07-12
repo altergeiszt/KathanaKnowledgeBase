@@ -53,6 +53,8 @@ BOOK_LABELS: dict[str, frozenset[ContentType]] = {
     "Fundamentals of Software Architecture": frozenset({ContentType.ARCHITECTURE}),
     "Software Architecture The Hard Parts": frozenset({ContentType.ARCHITECTURE}),
     "A Mathematical Introduction to Data Science": frozenset({ContentType.MATH}),
+    "A First Course in Linear Algebra": frozenset({ContentType.MATH}),
+    "linalgebra": frozenset({ContentType.MATH}),
     "Stats and Calculus Workshop with Python": frozenset({ContentType.MATH, ContentType.PYTHON}),
     "Mathematics of Machine Learning": frozenset({ContentType.ML, ContentType.MATH}),
     "An Introduction to Statistical Learning with Applications in Python": frozenset({ContentType.ML, ContentType.MATH}),

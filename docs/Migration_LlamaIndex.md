@@ -393,8 +393,10 @@ Rebuild is correct-by-construction and cheap, so it wins.
 ## 8. GraphNotes query interface (later)
 
 Once ingestion is stable, expose retrieval to GraphNotes as a read-only interface —
-a thin function/API, mirroring the current `api.py` role. PropertyGraphIndex composes
-retrievers you can pick per query:
+a thin function/API, mirroring the role of the old `api.py` (now archived at
+[`.archived_code/api.py`](../.archived_code/api.py) — LightRAG/SurrealDB era,
+non-functional; kept only as an endpoint/streaming reference for this rewrite).
+PropertyGraphIndex composes retrievers you can pick per query:
 
 - `LLMSynonymRetriever` — keyword/synonym node lookup
 - `VectorContextRetriever` — vector similarity (spans notes + books → the cross-source

@@ -1,0 +1,35 @@
+{
+  "entity_types": [
+    {"type": "Concept", "definition": "A general idea, theoretical construct, or object of study that isn't itself an algorithm, structure, pattern, or technology.", "examples": ["boolean algebra", "propositional logic", "big o notation", "bounded context", "domain event", "normal distribution"]},
+    {"type": "Algorithm", "definition": "A defined step-by-step procedure for solving a computational problem.", "examples": ["binary search", "linear search", "pagerank algorithm", "shortest path algorithm", "hash function", "sort"]},
+    {"type": "DataStructure", "definition": "A concrete way of organizing and storing data.", "examples": ["binary search tree", "linked list", "hash table", "priority queue", "heap", "adjacency matrix", "directed graph"]},
+    {"type": "DesignPattern", "definition": "A reusable, named solution to a recurring software design problem.", "examples": ["factory method pattern", "visitor pattern", "state pattern", "abstract factory pattern", "strategy pattern", "domain model pattern"]},
+    {"type": "ArchitectureStyle", "definition": "A high-level architectural approach for structuring a software system.", "examples": ["microservices architecture", "layered architecture", "event-driven architecture", "space-based architecture", "microkernel architecture", "data mesh architecture"]},
+    {"type": "Technology", "definition": "A named tool, platform, language, database, or framework.", "examples": ["MySQL", "SQL Server", "Hadoop", "Hive", "Apache Spark", "Python", "Jupyter Notebook"]},
+    {"type": "Principle", "definition": "A guiding rule or best practice for design or engineering decisions.", "examples": ["object-oriented design principles", "domain-driven design", "single responsibility principle", "separation of concerns"]},
+    {"type": "Technique", "definition": "A practical method or approach applied to accomplish a task (distinct from a formal Algorithm).", "examples": ["data mining", "data wrangling", "exploratory data analysis", "query optimization", "process improvement", "refactoring"]},
+    {"type": "Metric", "definition": "A measurable quantity used to evaluate a system, algorithm, or process.", "examples": ["architecture fitness function", "software architecture metrics", "running time", "query response time", "software metrics"]},
+    {"type": "QualityAttribute", "definition": "A non-functional property a system is designed or evaluated against.", "examples": ["software quality", "software reliability", "scalability", "data quality", "performance"]},
+    {"type": "Person", "definition": "A named individual referenced as an author, practitioner, or figure.", "examples": ["Martin Fowler", "Robert Sedgewick", "Rob Beezer"]},
+    {"type": "Work", "definition": "A referenced book, paper, or publication.", "examples": ["Clean Code", "Design Patterns", "Introduction to Algorithms", "Fundamentals of Software Architecture"]},
+    {"type": "Field", "definition": "A named discipline or area of study.", "examples": ["data science", "computer science", "machine learning", "software engineering", "systems thinking"]},
+    {"type": "Visualization", "definition": "A named chart type or method for visually representing data.", "examples": ["bar chart", "heatmap", "stacked bar chart", "time series plot", "data visualization"]}
+  ],
+  "relation_types": [
+    {"type": "IS_A", "definition": "Subject is a kind or subtype of the object.", "example": "DataStructure IS_A Concept (a hash table is a kind of associative container)"},
+    {"type": "PART_OF", "definition": "Subject is a component or member of the object.", "example": "Method PART_OF Algorithm (partitioning is part of quicksort)"},
+    {"type": "USES", "definition": "Subject employs or relies on the object as a building block.", "example": "Algorithm USES DataStructure (Dijkstra's algorithm uses a priority queue)"},
+    {"type": "IMPLEMENTS", "definition": "Subject provides a concrete realization of the object.", "example": "DataStructure IMPLEMENTS Concept (a hash table implements a map)"},
+    {"type": "SOLVES", "definition": "Subject addresses or resolves the object (a problem or need).", "example": "Algorithm SOLVES Concept (Dijkstra's algorithm solves shortest-path)"},
+    {"type": "IMPROVES", "definition": "Subject enhances or optimizes the object.", "example": "Technique IMPROVES QualityAttribute (indexing improves query performance)"},
+    {"type": "ALTERNATIVE_TO", "definition": "Subject is a substitutable option in place of the object.", "example": "ArchitectureStyle ALTERNATIVE_TO ArchitectureStyle (microservices alternative to monolith)"},
+    {"type": "CONTRASTS_WITH", "definition": "Subject is compared against the object to highlight a tradeoff or difference.", "example": "ArchitectureStyle CONTRASTS_WITH ArchitectureStyle (event-driven contrasts with layered)"},
+    {"type": "DEPENDS_ON", "definition": "Subject requires the object to function or hold.", "example": "Algorithm DEPENDS_ON DataStructure (heapsort depends on a heap)"},
+    {"type": "EXAMPLE_OF", "definition": "Subject is a concrete instance illustrating the object.", "example": "Technology EXAMPLE_OF ArchitectureStyle (Kafka is an example of event-driven architecture)"},
+    {"type": "DEFINES", "definition": "Subject formally specifies the meaning of the object.", "example": "Work DEFINES Concept (Design Patterns defines the strategy pattern)"},
+    {"type": "MEASURED_BY", "definition": "Subject is quantified or evaluated using the object.", "example": "QualityAttribute MEASURED_BY Metric (reliability measured by software reliability model)"},
+    {"type": "APPLIES_TO", "definition": "Subject is relevant or applicable within the domain of the object.", "example": "Technique APPLIES_TO Field (exploratory data analysis applies to data science)"},
+    {"type": "AUTHORED_BY", "definition": "Subject (a Work) was written by the object (a Person).", "example": "Work AUTHORED_BY Person (Clean Code authored by Robert Martin)"},
+    {"type": "RELATED_TO", "definition": "Catch-all association when no more specific relation applies.", "example": "Concept RELATED_TO Concept"}
+  ]
+}

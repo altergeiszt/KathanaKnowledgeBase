@@ -33,10 +33,16 @@ import logging
 import os
 import re
 import sys
-from dataclasses import dataclass, field, asdict
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field, asdict, fields, MISSING
+from datetime import datetime
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+import numpy as np
+from pydantic import PrivateAttr
 
 import yaml
 from bs4 import BeautifulSoup
@@ -74,7 +80,7 @@ from llama_index.core.schema import (
     TransformComponent,
 )
 from llama_index.core.graph_stores.types import KG_NODES_KEY, KG_RELATIONS_KEY
-from llama_index.core.indices.property_graph import SimpleLLMPathExtractor
+from llama_index.core.indices.property_graph import SimpleLLMPathExtractor, SchemaLLMPathExtractor
 from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
@@ -99,6 +105,32 @@ logging.basicConfig(
     handlers=[RichHandler(console=console, show_path=False)],
 )
 logger = logging.getLogger(__name__)
+
+
+def add_file_logging(working_dir: Path) -> Path:
+    """Attach a timestamped FileHandler to the root logger so every run leaves an
+    on-disk record. Console logging (RichHandler) is console-only, so a crashed or
+    overnight run otherwise leaves no trace once the terminal closes — which is
+    exactly how a silent zero-entity run went undiagnosed. Returns the log path."""
+    log_dir = working_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"ingest_{datetime.now():%Y%m%d_%H%M%S}.log"
+    root_logger = logging.getLogger()
+    # Drop any FileHandler from a prior call in this process (tests, repeated runs) so
+    # log records aren't duplicated across files. Close each to release the file handle.
+    for h in list(root_logger.handlers):
+        if isinstance(h, logging.FileHandler):
+            root_logger.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root_logger.addHandler(handler)
+    logger.info(f"Logging to {log_path}")
+    return log_path
 
 
 def make_progress() -> Progress:
@@ -145,6 +177,18 @@ class PipelineConfig:
     embedding_model: str = "all-MiniLM-L6-v2"
     ollama_host: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:14b"
+    # Extraction LLM: the model SimpleLLMPathExtractor uses for the curated slice.
+    # Empty → falls back to ollama_model (so existing single-model setups are unchanged).
+    # Split out so extraction can use a fast small model independent of any future
+    # query-role model.
+    extract_model: str = ""
+    # Thinking mode for the extraction LLM: "auto" | "on" | "off" | "none".
+    # "auto" disables thinking for thinking-capable models (qwen3, deepseek-r1, gpt-oss,
+    # …) — what you want for high-volume structured extraction — and leaves it unset for
+    # non-thinking models like qwen2.5 (sending think:false to those can error). "none"
+    # OMITS the flag entirely regardless of the model name — the escape hatch for a model
+    # the name heuristic misjudges (e.g. a new family that doesn't accept `think`).
+    extract_thinking: str = "auto"
     vector_dim: int = 384
     chunk_max_chars: int = 1500   # for semantic splitter
     # Neo4j PropertyGraphStore connection (§11). Password comes from the env only —
@@ -156,6 +200,24 @@ class PipelineConfig:
     # Curated-slice LLM extraction knobs (§10 — single pass, no gleaning).
     max_paths_per_chunk: int = 10
     extract_num_workers: int = 4
+    # Extractor: "schema" (SchemaLLMPathExtractor — constrained vocabulary, clean graph)
+    # or "simple" (SimpleLLMPathExtractor — free-form, noisy). See SCHEMA_ENTITIES/RELATIONS.
+    extractor: str = "schema"
+    # Strict schema mode: drop triples whose (subject_type, relation, object_type) fall
+    # outside the vocabulary. The vocabulary itself is always enforced via structured
+    # output; strict additionally prunes. Set False if the model struggles with strict
+    # structured output.
+    extract_strict: bool = True
+    # Path to a schema JSON ({"entity_types":[{"type":...}], "relation_types":[{"type":...}]}).
+    # Empty → the built-in SCHEMA_ENTITIES/SCHEMA_RELATIONS fallback. See schemas/.
+    schema_path: str = ""
+    # Canonicalize free-form relation labels to the schema's relation vocabulary via
+    # embedding similarity (local models can't self-constrain via structured output).
+    # True → RelationCanonicalizer; False → RelationLabelSanitizer (backtick cleanup only).
+    canonicalize: bool = True
+    # Cosine-similarity floor for snapping a relation label to a schema type; below it,
+    # the label falls back to RELATED_TO (or the last schema relation).
+    canon_threshold: float = 0.45
     # Map directory name fragments → content type
     content_type_rules: dict[str, str] = field(default_factory=lambda: {
         "software": "software",
@@ -169,45 +231,100 @@ class PipelineConfig:
     })
 
 
+def _env_bool(v: str) -> bool:
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Config key -> (environment variable name(s), parser). Multiple names = fallbacks,
+# first-set wins. Keys NOT listed here (dedup_*, chunk_max_chars, content_type_rules)
+# are configurable via config.yaml only — they have no env override.
+_ENV_SPEC: dict[str, tuple[list[str], Any]] = {
+    "library_path":           (["LIBRARY_PATH"], str),
+    "working_dir":            (["WORKING_DIR", "LIGHTRAG_WORKING_DIR"], str),
+    "extraction_workers":     (["EXTRACTION_WORKERS"], int),
+    "max_concurrent_inserts": (["MAX_CONCURRENT_INSERTS"], int),
+    "insert_timeout":         (["INSERT_TIMEOUT"], int),
+    "embedding_model":        (["EMBEDDING_MODEL"], str),
+    "ollama_host":            (["OLLAMA_HOST"], str),
+    "ollama_model":           (["OLLAMA_MODEL"], str),
+    "extract_model":          (["EXTRACT_MODEL"], str),
+    "extract_thinking":       (["EXTRACT_THINKING"], str),
+    "extractor":              (["EXTRACTOR"], str),
+    "schema_path":            (["SCHEMA_PATH"], str),
+    "extract_strict":         (["EXTRACT_STRICT"], _env_bool),
+    "canonicalize":           (["CANONICALIZE"], _env_bool),
+    "vector_dim":             (["VECTOR_DIM", "SURREALDB_VECTOR_DIM"], int),
+    "neo4j_url":              (["NEO4J_URL"], str),
+    "neo4j_user":             (["NEO4J_USER"], str),
+    "neo4j_password":         (["NEO4J_PASSWORD"], str),
+    "neo4j_database":         (["NEO4J_DATABASE"], str),
+    "max_paths_per_chunk":    (["MAX_PATHS_PER_CHUNK"], int),
+    "extract_num_workers":    (["EXTRACT_NUM_WORKERS"], int),
+}
+
+
 def load_config(path: str | None) -> PipelineConfig:
-    defaults: dict[str, Any] = {
-        "library_path": os.getenv("LIBRARY_PATH", "./library"),
-        "working_dir":  os.getenv("WORKING_DIR", os.getenv("LIGHTRAG_WORKING_DIR", "./lightrag_data")),
-        "extraction_workers": int(os.getenv("EXTRACTION_WORKERS", "8")),
-        "max_concurrent_inserts": int(os.getenv("MAX_CONCURRENT_INSERTS", "4")),
-        "insert_timeout": int(os.getenv("INSERT_TIMEOUT", "300")),
-        "embedding_model": os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
-        "ollama_host":  os.getenv("OLLAMA_HOST",  "http://localhost:11434"),
-        "ollama_model": os.getenv("OLLAMA_MODEL", "qwen2.5:14b"),
-        "vector_dim":   int(os.getenv("VECTOR_DIM", os.getenv("SURREALDB_VECTOR_DIM", "384"))),
-        "neo4j_url":      os.getenv("NEO4J_URL", "neo4j://127.0.0.1:7687"),
-        "neo4j_user":     os.getenv("NEO4J_USER", "neo4j"),
-        "neo4j_password": os.getenv("NEO4J_PASSWORD", ""),
-        "neo4j_database": os.getenv("NEO4J_DATABASE", "llamaindex"),
-        "max_paths_per_chunk": int(os.getenv("MAX_PATHS_PER_CHUNK", "10")),
-        "extract_num_workers": int(os.getenv("EXTRACT_NUM_WORKERS", "4")),
-    }
+    """Resolve config with a single, documented precedence (highest wins):
+
+        environment / .env   >   config.yaml   >   dataclass defaults
+
+    Only env vars that are ACTUALLY SET override — an unset var never clobbers a
+    config.yaml value with a hardcoded fallback. Building the config from the full
+    field list (not a hand-picked subset) means no config.yaml key is silently dropped.
+    """
+    known = {f.name for f in fields(PipelineConfig)}
+
+    # Layer 1 — dataclass field defaults (the single source of truth for defaults).
+    resolved: dict[str, Any] = {}
+    for f in fields(PipelineConfig):
+        if f.default is not MISSING:
+            resolved[f.name] = f.default
+        elif f.default_factory is not MISSING:  # type: ignore[misc]
+            resolved[f.name] = f.default_factory()  # type: ignore[misc]
+    resolved.setdefault("library_path", "./library")       # required fields: seed a fallback
+    resolved.setdefault("working_dir", "./lightrag_data")
+
+    # Layer 2 — config.yaml (all recognized keys, so dedup_*/chunk_max_chars/etc. apply).
+    file_cfg: dict[str, Any] = {}
     if path and Path(path).exists():
         with open(path) as f:
-            file_cfg = yaml.safe_load(f) or {}
-        defaults.update(file_cfg)
-    return PipelineConfig(
-        library_path=Path(defaults["library_path"]),
-        working_dir=Path(defaults["working_dir"]),
-        extraction_workers=defaults["extraction_workers"],
-        max_concurrent_inserts=defaults["max_concurrent_inserts"],
-        insert_timeout=defaults["insert_timeout"],
-        embedding_model=defaults["embedding_model"],
-        ollama_host=defaults["ollama_host"],
-        ollama_model=defaults["ollama_model"],
-        vector_dim=defaults["vector_dim"],
-        neo4j_url=defaults["neo4j_url"],
-        neo4j_user=defaults["neo4j_user"],
-        neo4j_password=defaults["neo4j_password"],
-        neo4j_database=defaults["neo4j_database"],
-        max_paths_per_chunk=defaults["max_paths_per_chunk"],
-        extract_num_workers=defaults["extract_num_workers"],
-    )
+            loaded = yaml.safe_load(f)
+        if isinstance(loaded, dict):
+            file_cfg = loaded
+        elif loaded is not None:
+            # empty file (None) is fine → use defaults; a list/scalar is a config error.
+            logger.warning(
+                f"config.yaml at {path} is not a YAML mapping ({type(loaded).__name__}); ignoring it"
+            )
+    for k, v in file_cfg.items():
+        if k in known:
+            resolved[k] = v
+        else:
+            logger.warning(f"config.yaml: ignoring unknown key '{k}'")
+
+    # Layer 3 — environment / .env, only for vars actually present. Warn loudly when an
+    # env var overrides a DIFFERENT config.yaml value so the conflict is never silent.
+    for key, (env_names, parser) in _ENV_SPEC.items():
+        # Track WHICH env var was actually set (env_names may list fallbacks, e.g.
+        # WORKING_DIR / LIGHTRAG_WORKING_DIR) so the conflict message names the real one.
+        used = next((n for n in env_names if n in os.environ), None)
+        if used is None:
+            continue
+        val = parser(os.environ[used])
+        if key in file_cfg and str(file_cfg[key]) != str(val):
+            logger.warning(
+                f"Config conflict on '{key}': config.yaml={file_cfg[key]!r} overridden by "
+                f"env {used}={val!r} (env wins)."
+            )
+        resolved[key] = val
+
+    # extract_model defaults to the general ollama_model when left unset.
+    if not resolved.get("extract_model"):
+        resolved["extract_model"] = resolved["ollama_model"]
+
+    resolved["library_path"] = Path(resolved["library_path"])
+    resolved["working_dir"] = Path(resolved["working_dir"])
+    return PipelineConfig(**resolved)
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +546,9 @@ def apply_content_rules(raw: str, path: Path) -> list[Chunk]:
 def extract_document(path: Path) -> tuple[str, list[Chunk]]:
     """
     Entry point for multiprocessing workers.
-    Returns an empty list on any extraction failure (logged, not raised).
+    Returns (source_path, chunks); an empty list on any extraction failure
+    (logged, not raised). The first element is the FULL source path (not just the
+    basename) so the per-book raw cache can fingerprint the source file.
     """
     try:
         logger.debug(f"Extracting: {path.name}")
@@ -438,11 +557,11 @@ def extract_document(path: Path) -> tuple[str, list[Chunk]]:
         elif path.suffix.lower() == ".epub":
             raw = extract_epub(path)
         else:
-            return path.name, []
-        return path.name, apply_content_rules(raw, path)
+            return str(path), []
+        return str(path), apply_content_rules(raw, path)
     except Exception as exc:
         logger.error(f"Extraction failed for {path}: {exc}")
-        return path.name, []
+        return str(path), []
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +594,93 @@ def deduplicate(chunks: list[Chunk], threshold: float = 0.85, num_perm: int = 12
     return kept
 
 # ---------------------------------------------------------------------------
+# Atomic JSON write — temp file in the same dir + os.replace, so a crash mid-write
+# never leaves a truncated file that a later run would load as a valid (short)
+# checkpoint. os.replace is atomic on the same filesystem.
+# ---------------------------------------------------------------------------
+
+def _atomic_write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        # A non-serializable obj or a failed replace would otherwise leave an orphaned
+        # .tmp behind; remove it (best-effort) and re-raise the original error.
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Per-book raw chunk cache (pre-dedup crash resilience — Option A)
+# ---------------------------------------------------------------------------
+# Extraction (docling + EasyOCR) is the slow, memory-hungry, crash-prone phase.
+# Each book's raw chunks are cached the moment its worker returns, so a crash or
+# OOM mid-run loses at most the in-flight book: a re-run reloads the cached books
+# and re-parses only what is missing or stale. Dedup stays a single GLOBAL pass
+# over the reassembled corpus (it is inherently cross-book), so these cache
+# entries are PRE-dedup — the post-dedup checkpoint is written once, downstream.
+
+def raw_cache_dir(config: PipelineConfig) -> Path:
+    return config.working_dir / "raw_chunks"
+
+
+def _file_fingerprint(path: Path) -> str:
+    """Size+mtime signature so an edited source file invalidates its stale cache."""
+    st = path.stat()
+    return f"{st.st_size}:{int(st.st_mtime)}"
+
+
+def raw_cache_path(config: PipelineConfig, source: str | Path) -> Path:
+    # Keyed by filename stem. This assumes stems are unique across the library — an
+    # invariant the library is hand-curated to guarantee (one file per stem, no
+    # same-named files in different subdirectories). Two files sharing a stem would
+    # collide here and mix/overwrite each other's cached chunks.
+    return raw_cache_dir(config) / f"{Path(source).stem}.json"
+
+
+def save_raw_book(source: str | Path, chunks: list[Chunk], config: PipelineConfig) -> None:
+    """Persist one book's raw (pre-dedup) chunks, keyed by a size+mtime fingerprint.
+
+    Callers should skip empty chunk lists (an extraction failure returns []): caching
+    an empty result would make a transient OOM look like a permanently-parsed book and
+    suppress the retry on the next run.
+    """
+    src = Path(source)
+    payload = {
+        "source": str(src),
+        "fingerprint": _file_fingerprint(src) if src.exists() else "",
+        "chunks": [asdict(c) for c in chunks],
+    }
+    _atomic_write_json(raw_cache_path(config, source), payload)
+
+
+def load_raw_book(source: str | Path, config: PipelineConfig) -> list[Chunk] | None:
+    """Return cached raw chunks for a book, or None if absent, stale, or corrupt.
+
+    Stale = the source file's size+mtime no longer matches the cached fingerprint,
+    so an edited PDF/EPUB is re-parsed instead of served from a stale cache. A
+    half-written cache (crash mid-write) fails to parse and is treated as absent.
+    """
+    path = raw_cache_path(config, source)
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None  # corrupt / half-written → re-parse
+    src = Path(source)
+    if src.exists() and payload.get("fingerprint") != _file_fingerprint(src):
+        return None
+    return [Chunk(**c) for c in payload["chunks"]]
+
+
+# ---------------------------------------------------------------------------
 # Chunk checkpointing (post-dedup, pre-insertion)
 # ---------------------------------------------------------------------------
 
@@ -485,9 +691,7 @@ def checkpoint_path(config: PipelineConfig) -> Path:
 def save_chunks_checkpoint(chunks: list[Chunk], config: PipelineConfig) -> None:
     """Persist the post-dedup chunk list to disk before insertion begins."""
     path = checkpoint_path(config)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump([asdict(c) for c in chunks], f)
+    _atomic_write_json(path, [asdict(c) for c in chunks])
     logger.info(f"Checkpoint written: {len(chunks)} chunks -> {path}")
 
 
@@ -499,6 +703,126 @@ def load_chunks_checkpoint(config: PipelineConfig) -> list[Chunk]:
     chunks = [Chunk(**c) for c in raw]
     logger.info(f"Checkpoint loaded: {len(chunks)} chunks <- {path}")
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Extraction progress checkpoint (INSERT-half resume — the expensive LLM pass)
+# ---------------------------------------------------------------------------
+# The curated-slice LLM extraction runs the model per chunk (~seconds each), and a
+# single insert_nodes() call over thousands of chunks has no resume point: a crash
+# restarts the whole pass. Worse, TextNode ids are random per run, so a re-run
+# duplicates rather than MERGE-ing — Neo4j gives no cross-run idempotency here.
+#
+# So we insert in chunk-batches and, after each batch COMMITS, record the completed
+# chunks by a STABLE content key (hash of source_path+text — not the volatile
+# node_id) in extract_progress.json. A resume skips done chunks, re-running only the
+# unfinished tail. The file is fingerprinted to the checkpoint it was built against,
+# so a changed corpus invalidates stale progress. Cleared on clean completion / --reset.
+
+EXTRACT_BATCH_CHUNKS = 50  # chunks per commit; bounds re-work on crash to one batch
+
+
+def extract_progress_path(config: PipelineConfig) -> Path:
+    return config.working_dir / "extract_progress.json"
+
+
+def _checkpoint_fingerprint(config: PipelineConfig) -> str:
+    """size:mtime of chunks_checkpoint.json — ties progress to a specific corpus."""
+    st = checkpoint_path(config).stat()
+    return f"{st.st_size}:{int(st.st_mtime)}"
+
+
+def _chunk_key(chunk: Chunk) -> str:
+    """Stable per-chunk key that survives re-running chunk_to_nodes (unlike node_id)."""
+    h = hashlib.sha1()
+    h.update(chunk.source_path.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(chunk.text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def load_extract_progress(config: PipelineConfig) -> dict:
+    """Return {'fingerprint', 'embed': set, 'curated': set}. Absent, unreadable, or
+    stale (checkpoint changed) progress yields a fresh empty record."""
+    fresh = {"fingerprint": _checkpoint_fingerprint(config), "embed": set(), "curated": set()}
+    path = extract_progress_path(config)
+    if not path.exists():
+        return fresh
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("fingerprint") != fresh["fingerprint"]:
+            logger.warning("extract_progress.json is stale (checkpoint changed); ignoring it")
+            return fresh
+        return {
+            "fingerprint": data["fingerprint"],
+            "embed": set(data.get("embed", [])),
+            "curated": set(data.get("curated", [])),
+        }
+    except (json.JSONDecodeError, OSError, KeyError, TypeError, AttributeError):
+        # Corrupt / half-written / wrong-shaped (e.g. a JSON list) → start fresh.
+        return fresh
+
+
+def save_extract_progress(progress: dict, config: PipelineConfig) -> None:
+    _atomic_write_json(extract_progress_path(config), {
+        "fingerprint": progress["fingerprint"],
+        "embed": sorted(progress["embed"]),
+        "curated": sorted(progress["curated"]),
+    })
+
+
+def clear_extract_progress(config: PipelineConfig) -> None:
+    extract_progress_path(config).unlink(missing_ok=True)
+
+
+def insert_chunks_batched(
+    index: PropertyGraphIndex,
+    chunks_subset: list[Chunk],
+    progress: dict,
+    bucket: str,               # "embed" | "curated"
+    config: PipelineConfig,
+    *,
+    label: str,
+    batch_chunks: int = EXTRACT_BATCH_CHUNKS,
+    reset_llm: Any = None,
+) -> int:
+    """Insert nodes for chunks_subset in chunk-batches, skipping any already recorded
+    done in progress[bucket], checkpointing progress after each committed batch. Returns
+    the node count inserted this run.
+
+    reset_llm (the extraction Ollama LLM, curated path only): PropertyGraphIndex.insert_nodes
+    spins a fresh asyncio event loop per call and closes it, but the Ollama LLM caches its
+    httpx AsyncClient bound to the FIRST loop — so batch 2+ would reuse a client tied to a
+    closed loop and raise "RuntimeError: Event loop is closed". Dropping the cached client
+    before each batch forces a fresh one bound to that batch's loop.
+    """
+    done = progress[bucket]
+    pending = [c for c in chunks_subset if _chunk_key(c) not in done]
+    skipped = len(chunks_subset) - len(pending)
+    if skipped:
+        logger.info(f"{label}: skipping {skipped} chunk(s) already done (resume)")
+    if not pending:
+        return 0
+
+    total_batches = (len(pending) + batch_chunks - 1) // batch_chunks
+    inserted = 0
+    for bi, i in enumerate(range(0, len(pending), batch_chunks), start=1):
+        batch = pending[i : i + batch_chunks]
+        nodes: list[TextNode] = []
+        for c in batch:
+            nodes.extend(chunk_to_nodes(c))
+        logger.info(f"{label}: batch {bi}/{total_batches} - {len(nodes)} node(s) from {len(batch)} chunk(s)...")
+        if reset_llm is not None:
+            # Force a fresh AsyncClient on this batch's event loop (see docstring).
+            reset_llm._client = None
+            reset_llm._async_client = None
+        index.insert_nodes(nodes)                 # commits to Neo4j
+        for c in batch:                           # mark done only AFTER the commit
+            done.add(_chunk_key(c))
+        save_extract_progress(progress, config)   # atomic; survives a crash on the next batch
+        inserted += len(nodes)
+    return inserted
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +928,88 @@ class EmbedOnlyExtractor(TransformComponent):
         return self.__call__(nodes, **kwargs)
 
 
+class RelationCanonicalizer(TransformComponent):
+    """Snap free-form relation labels to a fixed vocabulary by embedding similarity.
+
+    Local models over Ollama can't self-constrain their relation vocabulary: schema
+    strict mode returns empty, non-strict is ignored (see docs). So we extract free-form
+    (which works) and canonicalize HERE — embed each extracted relation label, cosine-
+    compare to the schema's relation types, and snap to the nearest above `threshold`
+    (else the RELATED_TO catch-all). Reuses the pipeline's embedding model (no extra LLM
+    cost), also strips backticks (apoc.merge.relationship safety), and caches by label."""
+
+    threshold: float = 0.45
+    _types: list = PrivateAttr(default_factory=list)
+    _fallback: str = PrivateAttr(default="RELATED_TO")
+    _vecs: Any = PrivateAttr(default=None)           # (n_types, dim) L2-normalized
+    _embed: Any = PrivateAttr(default=None)
+    _cache: dict = PrivateAttr(default_factory=dict)
+
+    def __init__(self, relation_types, embed_texts, embed_model, threshold: float = 0.45, **kwargs):
+        super().__init__(threshold=threshold, **kwargs)
+        self._types = list(relation_types)
+        self._embed = embed_model
+        self._fallback = "RELATED_TO" if "RELATED_TO" in self._types else self._types[-1]
+        vecs = np.asarray(embed_model.get_text_embedding_batch(list(embed_texts)), dtype=float)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self._vecs = vecs / norms
+        # Seed the cache so exact-vocabulary labels short-circuit to themselves.
+        for t in self._types:
+            self._cache[t.upper().replace(" ", "_")] = t
+
+    def _canon(self, label: str) -> str:
+        clean = " ".join(label.replace("`", "").split()).strip()
+        if not clean:
+            return self._fallback
+        key = clean.upper().replace(" ", "_")
+        if key in self._cache:
+            return self._cache[key]
+        v = np.asarray(self._embed.get_text_embedding(clean.replace("_", " ").lower()), dtype=float)
+        n = np.linalg.norm(v) or 1.0
+        sims = self._vecs @ (v / n)
+        best = int(sims.argmax())
+        result = self._types[best] if sims[best] >= self.threshold else self._fallback
+        self._cache[key] = result
+        return result
+
+    def __call__(self, nodes, **kwargs):
+        for node in nodes:
+            for rel in node.metadata.get(KG_RELATIONS_KEY, []) or []:
+                if getattr(rel, "label", None):
+                    rel.label = self._canon(rel.label)
+        return nodes
+
+    async def acall(self, nodes, **kwargs):
+        return self.__call__(nodes, **kwargs)
+
+
+class RelationLabelSanitizer(TransformComponent):
+    """Clean extracted relation labels so they can't break Neo4j's relationship-type
+    syntax. `apoc.merge.relationship` INLINES the relation type into dynamically-built
+    Cypher (backtick-quoted) and does NOT escape internal backticks — so a schema-free
+    label like `` `is written as` `` (stray backticks from the LLM) prematurely closes
+    the quote and raises a SyntaxException mid-batch, crashing the whole run.
+
+    Runs AFTER SimpleLLMPathExtractor on the curated path: strips backticks and collapses
+    whitespace (newlines/tabs) in each relation label, keeping everything else so the raw
+    extraction is still faithfully represented (important for the model A/B). A constrained
+    SchemaLLMPathExtractor would make this unnecessary — this only defends the free-form path."""
+
+    def __call__(self, nodes, **kwargs):
+        for node in nodes:
+            for rel in node.metadata.get(KG_RELATIONS_KEY, []) or []:
+                label = getattr(rel, "label", None)
+                if not label:
+                    continue
+                safe = " ".join(label.replace("`", "").split()).strip()
+                rel.label = safe or "RELATED_TO"
+        return nodes
+
+    async def acall(self, nodes, **kwargs):
+        return self.__call__(nodes, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Neo4j PropertyGraphIndex setup (§5, §11)
 # ---------------------------------------------------------------------------
@@ -613,6 +1019,141 @@ class Stores:
     graph_store: Neo4jPropertyGraphStore
     extract_index: PropertyGraphIndex   # curated slice → LLM entity extraction
     embed_index: PropertyGraphIndex     # everything else → embeddings only
+    extract_llm: Ollama                 # the extraction LLM (client reset between batches)
+
+
+# Substrings that mark a hybrid-reasoning ("thinking") model. Used only by the "auto"
+# thinking policy — not exhaustive, just the families likely to be used for extraction.
+_THINKING_MODEL_HINTS = ("qwen3", "deepseek-r1", "deepseek-v3", "gpt-oss", "magistral", "-r1", "reasoning")
+
+
+def _is_thinking_model(model: str) -> bool:
+    name = model.lower()
+    return any(hint in name for hint in _THINKING_MODEL_HINTS)
+
+
+def _resolve_thinking(model: str, setting: str) -> bool | None:
+    """Map the extract_thinking policy to the Ollama `thinking` arg.
+
+    Returns False (disable) / True (enable) / None (omit the flag — the model default).
+    None is important for non-thinking models (e.g. qwen2.5): sending think:false to a
+    model that doesn't support thinking can error, so "auto"/"none" omit it for those.
+    """
+    setting = (setting or "auto").strip().lower()
+    if setting == "on":
+        return True
+    if setting == "off":
+        return False
+    if setting == "none":
+        # Escape hatch: omit the flag regardless of the model-name heuristic — use this
+        # when a model is misjudged as thinking-capable (e.g. a new family) and rejects
+        # the `think` param.
+        return None
+    # auto: disable thinking for thinking-capable models, leave others untouched.
+    return False if _is_thinking_model(model) else None
+
+
+# ---------------------------------------------------------------------------
+# Graph schema — constrained vocabulary for SchemaLLMPathExtractor
+# ---------------------------------------------------------------------------
+# The schema is normally loaded from a JSON file (config.schema_path / SCHEMA_PATH) with
+# shape {"entity_types":[{"type":...}], "relation_types":[{"type":...}]} — see
+# schemas/ and docs/Schema_Vocabulary_Handoff.md. These built-in lists are only the
+# FALLBACK used when no schema_path is set. The constrained vocabulary is the whole point:
+# the free-form extractor produced ~2 relations per type (437 types / 855 rels on 100
+# chunks); a fixed vocabulary yields dozens of edges per type, keeping the full-corpus
+# graph traversable instead of a hairball.
+SCHEMA_ENTITIES: list[str] = [
+    "Concept", "Technique", "Technology", "DataStructure", "Principle",
+    "QualityAttribute", "Person", "Work", "Metric", "Field", "Example",
+    "Dataset", "Query", "Visualization",
+]
+SCHEMA_RELATIONS: list[str] = [
+    "IS_A", "PART_OF", "USES", "IMPLEMENTS", "SOLVES", "IMPROVES",
+    "ALTERNATIVE_TO", "CONTRASTS_WITH", "EXAMPLE_OF", "DEFINES",
+    "HAS_PROPERTY", "APPLIES_TO", "AUTHORED_BY", "RELATED_TO",
+]
+
+
+def load_schema(config: PipelineConfig) -> tuple[list[str], list[str]]:
+    """Return (entity_types, relation_types). From config.schema_path (a JSON file with
+    'entity_types'/'relation_types' lists of {'type': ...} objects) if set, else the
+    built-in SCHEMA_ENTITIES / SCHEMA_RELATIONS fallback."""
+    if not config.schema_path:
+        return list(SCHEMA_ENTITIES), list(SCHEMA_RELATIONS)
+    path = Path(config.schema_path)
+    if not path.exists():
+        raise SystemExit(f"schema_path does not exist: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entities = [e["type"] for e in data["entity_types"]]
+        relations = [r["type"] for r in data["relation_types"]]
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as exc:
+        raise SystemExit(
+            f"schema_path {path} is malformed ({exc}); expected "
+            "{'entity_types':[{'type':...}], 'relation_types':[{'type':...}]}"
+        )
+    if not entities or not relations:
+        raise SystemExit(f"schema_path {path}: entity_types and relation_types must be non-empty")
+    return entities, relations
+
+
+def load_relation_vocab(config: PipelineConfig) -> tuple[list[str], list[str]]:
+    """Return (relation_types, embed_texts) for the RelationCanonicalizer. embed_texts[i]
+    is 'type words: definition' (richer signal for embedding matching) when the schema
+    JSON provides definitions, else just the type name. Falls back to the built-in
+    SCHEMA_RELATIONS when no schema_path is set."""
+    if not config.schema_path:
+        return list(SCHEMA_RELATIONS), [t.replace("_", " ").lower() for t in SCHEMA_RELATIONS]
+    # schema_path is already validated by load_schema() before this runs.
+    data = json.loads(Path(config.schema_path).read_text(encoding="utf-8"))
+    types, texts = [], []
+    for r in data["relation_types"]:
+        t = r["type"]
+        d = (r.get("definition") or "").strip()
+        types.append(t)
+        words = t.replace("_", " ").lower()
+        texts.append(f"{words}: {d}" if d else words)
+    return types, texts
+
+
+def build_kg_extractor(config: PipelineConfig, llm: Ollama):
+    """Build the curated-slice KG extractor selected by config.extractor.
+
+    "schema" (default): SchemaLLMPathExtractor constrains the LLM — via structured output —
+    to the entity/relation types from load_schema(). That constrained vocabulary is what
+    keeps a full-corpus graph usable. The validation schema is permissive (every entity
+    type may use every relation), so strict mode enforces the vocabulary without
+    prematurely restricting which entity types may pair.
+
+    "simple": the original free-form SimpleLLMPathExtractor (noisy; kept for comparison).
+    """
+    if config.extractor == "simple":
+        logger.info("Extractor: SimpleLLMPathExtractor (free-form)")
+        return SimpleLLMPathExtractor(
+            llm=llm,
+            max_paths_per_chunk=config.max_paths_per_chunk,
+            num_workers=config.extract_num_workers,
+        )
+
+    entity_types, relation_types = load_schema(config)
+    entities = Literal[tuple(entity_types)]     # type: ignore[valid-type]
+    relations = Literal[tuple(relation_types)]  # type: ignore[valid-type]
+    validation = {e: list(relation_types) for e in entity_types}  # permissive
+    src = Path(config.schema_path).name if config.schema_path else "built-in"
+    logger.info(
+        f"Extractor: SchemaLLMPathExtractor (strict={config.extract_strict}; "
+        f"{len(entity_types)} entity types, {len(relation_types)} relation types; schema={src})"
+    )
+    return SchemaLLMPathExtractor(
+        llm=llm,
+        possible_entities=entities,
+        possible_relations=relations,
+        kg_validation_schema=validation,
+        strict=config.extract_strict,
+        max_triplets_per_chunk=config.max_paths_per_chunk,
+        num_workers=config.extract_num_workers,
+    )
 
 
 def init_stores(config: PipelineConfig) -> Stores:
@@ -634,10 +1175,16 @@ def init_stores(config: PipelineConfig) -> Stores:
     )
     storage = StorageContext.from_defaults(property_graph_store=graph_store)
 
+    thinking = _resolve_thinking(config.extract_model, config.extract_thinking)
     llm = Ollama(
-        model=config.ollama_model,
+        model=config.extract_model,
         base_url=config.ollama_host,
         request_timeout=float(config.insert_timeout) if config.insert_timeout else 600.0,
+        thinking=thinking,
+    )
+    logger.info(
+        f"Extraction LLM: {config.extract_model} "
+        f"(thinking={'default' if thinking is None else thinking}; policy={config.extract_thinking})"
     )
     embed = HuggingFaceEmbedding(model_name=config.embedding_model)
 
@@ -647,13 +1194,21 @@ def init_stores(config: PipelineConfig) -> Stores:
         storage_context=storage,
         show_progress=True,
     )
+    # Relation post-processor: canonicalize free-form labels to the schema vocabulary
+    # (the reliable path — local models can't self-constrain), or just sanitize backticks.
+    if config.canonicalize:
+        rel_types, rel_texts = load_relation_vocab(config)
+        post = RelationCanonicalizer(rel_types, rel_texts, embed, threshold=config.canon_threshold)
+        logger.info(
+            f"Relation canonicalizer: snapping to {len(rel_types)} schema relation type(s) "
+            f"(threshold={config.canon_threshold})"
+        )
+    else:
+        post = RelationLabelSanitizer()
+        logger.info("Relation post-processing: sanitize only (canonicalize=false)")
     extract_index = PropertyGraphIndex.from_existing(
         llm=llm,
-        kg_extractors=[SimpleLLMPathExtractor(
-            llm=llm,
-            max_paths_per_chunk=config.max_paths_per_chunk,
-            num_workers=config.extract_num_workers,
-        )],
+        kg_extractors=[build_kg_extractor(config, llm), post],
         **common,
     )
     embed_index = PropertyGraphIndex.from_existing(
@@ -662,9 +1217,9 @@ def init_stores(config: PipelineConfig) -> Stores:
     )
     logger.info(
         f"Neo4j PropertyGraphIndex ready at {config.neo4j_url} (db={config.neo4j_database}); "
-        f"LLM={config.ollama_model}, embed={config.embedding_model}"
+        f"extract_model={config.extract_model}, embed={config.embedding_model}"
     )
-    return Stores(graph_store, extract_index, embed_index)
+    return Stores(graph_store, extract_index, embed_index, llm)
 
 
 def reset_book_namespace(graph_store: Neo4jPropertyGraphStore) -> None:
@@ -684,16 +1239,112 @@ def reset_book_namespace(graph_store: Neo4jPropertyGraphStore) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Preflight & idempotency guards
+# ---------------------------------------------------------------------------
+
+# WHERE clause identifying the book namespace, shared by the purge and the count so
+# the idempotency guard sees exactly what --reset would delete.
+_BOOK_NS_WHERE = (
+    "n.source_type = 'book' OR n.id STARTS WITH 'book::' "
+    "OR n.ref_doc_id STARTS WITH 'book::'"
+)
+
+
+def count_book_nodes(graph_store: Neo4jPropertyGraphStore) -> int:
+    """How many nodes already live in the book namespace (see reset_book_namespace)."""
+    rows = graph_store.structured_query(
+        f"MATCH (n) WHERE {_BOOK_NS_WHERE} RETURN count(n) AS c"
+    )
+    return rows[0]["c"] if rows else 0
+
+
+def _check_ollama(config: PipelineConfig) -> None:
+    """Fail fast if Ollama is unreachable or the extraction model isn't pulled —
+    otherwise this only surfaces after hours of extraction, at the first insert."""
+    tags_url = config.ollama_host.rstrip("/") + "/api/tags"
+    try:
+        with urllib.request.urlopen(tags_url, timeout=5) as resp:
+            payload = json.load(resp)
+        # Parse inside the try: a malformed host raises ValueError from urlopen, and an
+        # unexpected payload shape raises AttributeError/TypeError here — all should
+        # surface as a clean SystemExit, not an unhandled crash.
+        names = {m.get("name", "") for m in payload.get("models", [])}
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError, AttributeError, TypeError) as exc:
+        raise SystemExit(
+            f"Preflight: Ollama unreachable or returned an invalid response at {config.ollama_host} ({exc}). "
+            f"Start it (`ollama serve`) or set OLLAMA_HOST. Use --skip-preflight to bypass."
+        )
+    # Ollama tags carry a ':tag' suffix; accept an exact match or a bare-name match.
+    bare = {n.split(":", 1)[0] for n in names}
+    # Check the EXTRACTION model — that's the one the insert half actually calls.
+    model = config.extract_model
+    if model not in names and model.split(":", 1)[0] not in bare:
+        raise SystemExit(
+            f"Preflight: extraction model '{model}' is not pulled in Ollama "
+            f"(have: {sorted(names) or 'none'}). Run `ollama pull {model}`. "
+            f"Use --skip-preflight to bypass."
+        )
+    logger.info(f"Preflight OK: Ollama reachable at {config.ollama_host}, extraction model '{model}' present")
+
+
+def preflight(config: PipelineConfig, *, check_ollama: bool, check_library: bool) -> None:
+    """Fail-fast checks before any expensive work. Neo4j reachability is already
+    validated by init_stores; this covers the two gaps that bite late: a missing
+    Ollama model (only hit at first insert) and an empty library."""
+    if check_library:
+        if not config.library_path.exists():
+            raise SystemExit(f"Preflight: library_path does not exist: {config.library_path}")
+        if not discover_files(config.library_path):
+            raise SystemExit(
+                f"Preflight: no PDF/EPUB files under {config.library_path}. "
+                f"Use --skip-preflight to bypass."
+            )
+    if check_ollama:
+        _check_ollama(config)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
-def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: bool = False, profile: bool = False) -> None:
-    # Stage 1: connect to Neo4j and build the two index views.
-    stores = init_stores(config)
+def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: bool = False, profile: bool = False, extract_only: bool = False, require_curated: bool = False, skip_preflight: bool = False, extract_all: bool = False) -> None:
+    # Every run leaves an on-disk log (console logging alone is lost when the terminal
+    # closes — the reason a silent overnight run once went undiagnosed).
+    add_file_logging(config.working_dir)
+    # Log the RESOLVED config so a wrong library/DB is visible up front (and persisted to
+    # the file log), not silently inferred from bad results later.
+    logger.info(
+        f"Effective config: library_path={config.library_path} | working_dir={config.working_dir} "
+        f"| neo4j_db={config.neo4j_database} @ {config.neo4j_url} "
+        f"| extract_model={config.extract_model} (thinking={config.extract_thinking}) "
+        f"| ollama_model={config.ollama_model}"
+    )
+
+    # --extract-only and --from-checkpoint are opposite halves of the split run and
+    # cannot both apply: one does extraction-then-stop, the other skips extraction.
+    if extract_only and from_checkpoint:
+        logger.warning("--extract-only and --from-checkpoint are mutually exclusive; ignoring --from-checkpoint")
+        from_checkpoint = False
+
+    # Preflight fail-fast (before any expensive work). A fresh run needs a non-empty
+    # library; any run that will insert needs the Ollama model pulled — otherwise that
+    # only surfaces at the first insert, after extraction has already run.
+    will_extract = not (from_checkpoint and checkpoint_path(config).exists())
+    if skip_preflight:
+        logger.warning("--skip-preflight: skipping Ollama/library preflight checks")
+    else:
+        preflight(config, check_ollama=not extract_only, check_library=will_extract)
+
+    # Stage 1: connect to Neo4j and build the two index views. --extract-only stops
+    # before insertion, so it needs no DB connection at all (Neo4j need not be up).
+    stores = None if extract_only else init_stores(config)
 
     # Stage 0: (optional) purge the book namespace before re-ingesting.
     if reset:
-        reset_book_namespace(stores.graph_store)
+        if extract_only:
+            logger.warning("--reset has no effect with --extract-only (no DB is touched); ignoring")
+        else:
+            reset_book_namespace(stores.graph_store)
 
     if profile and Profiler is None:
         logger.warning("--profile requested but pipeline_profiler is unavailable (archived); continuing without profiling")
@@ -714,22 +1365,58 @@ def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: b
             logger.warning(f"No PDF/EPUB files found under {config.library_path}")
             return
 
+        # Per-book raw cache (Option A crash resilience): split discovered files into
+        # those already parsed by a prior (possibly crashed) run and those still needing
+        # extraction. Only missing/stale books are re-parsed; each is cached the moment
+        # its worker returns, so a crash mid-extraction loses at most the in-flight book.
+        all_chunks: list[Chunk] = []
+        to_parse: list[Path] = []
+        for f in files:
+            cached = load_raw_book(f, config)
+            if cached is None:
+                to_parse.append(f)
+            else:
+                all_chunks.extend(cached)
+        if all_chunks:
+            logger.info(
+                f"Resuming from raw cache: {len(all_chunks)} chunk(s) from "
+                f"{len(files) - len(to_parse)} cached book(s); {len(to_parse)} to parse"
+            )
+
         # Parallel extraction (CPU-bound → multiprocessing).
         # NOTE: worker count is capped well below cpu_count() — each worker runs a full
         # docling+EasyOCR pipeline that can need several GB for large PDFs, so a high
         # process count risks OOM (workers silently drop documents via MemoryError,
         # producing a near-empty result set instead of a clean failure).
-        logger.info(f"Extracting {len(files)} documents using {config.extraction_workers} workers...")
-        all_chunks: list[Chunk] = []
-        with stage("extraction", n_files=len(files)):
-            with make_progress() as progress, Pool(processes=config.extraction_workers) as pool:
-                task = progress.add_task("Extracting documents", total=len(files))
-                for name, doc_chunks in pool.imap_unordered(extract_document, files):
-                    all_chunks.extend(doc_chunks)
-                    progress.update(task, description=f"Extracted {name}")
-                    progress.advance(task)
+        if to_parse:
+            logger.info(f"Extracting {len(to_parse)} documents using {config.extraction_workers} workers...")
+            with stage("extraction", n_files=len(to_parse)):
+                with make_progress() as progress, Pool(processes=config.extraction_workers) as pool:
+                    task = progress.add_task("Extracting documents", total=len(to_parse))
+                    for source, doc_chunks in pool.imap_unordered(extract_document, to_parse):
+                        # Cache before extending: persist each book's work before we
+                        # could crash on a later one. Skip empty results (extraction
+                        # failure) so a transient OOM is retried, not cached as done.
+                        if doc_chunks:
+                            save_raw_book(source, doc_chunks, config)
+                        all_chunks.extend(doc_chunks)
+                        progress.update(task, description=f"Extracted {Path(source).name}")
+                        progress.advance(task)
 
         logger.info(f"Extraction complete: {len(all_chunks)} raw chunks")
+
+        # Dropped-document detection: books that yielded 0 chunks — an extraction
+        # failure or a silent worker OOM (see the multiprocessing note above). With the
+        # full source path now on every chunk, these are exactly the discovered files
+        # absent from the produced set. Warn loudly rather than let a near-empty corpus
+        # sail through as if it were complete.
+        produced = {c.source_path for c in all_chunks}
+        dropped = [f for f in files if str(f) not in produced]
+        if dropped:
+            logger.warning(
+                f"{len(dropped)}/{len(files)} document(s) produced 0 chunks "
+                f"(extraction failure or OOM): {[f.name for f in dropped]}"
+            )
 
         # Deduplication
         with stage("deduplication", n_chunks=len(all_chunks)):
@@ -743,37 +1430,106 @@ def run_pipeline(config: PipelineConfig, reset: bool = False, from_checkpoint: b
         # Checkpoint: persist the post-dedup chunk list before insertion begins
         save_chunks_checkpoint(chunks, config)
 
-    # Stage 5: hybrid node build + insertion (§5).
-    # Split chunks by curated-slice membership: curated books get full LLM entity
-    # extraction; everything else is embeddings-only but still vector-searchable.
-    curated_nodes: list[TextNode] = []
-    embed_nodes: list[TextNode] = []
+    # --extract-only: chunks are now parsed, deduped, and on disk. Stop before the
+    # embed/insert half — resume it later (e.g. another night) with --from-checkpoint.
+    if extract_only:
+        logger.info(f"Extract-only complete: {len(chunks)} chunks checkpointed to "
+                    f"{checkpoint_path(config)}; stopping before embedding/insertion.")
+        if profiler:
+            profiler.report()
+        return
+
+    # Load any partial-insertion progress (empty on a fresh run). A --reset wipes the
+    # namespace, so it must also discard stale progress and start from a clean slate.
+    if reset:
+        clear_extract_progress(config)
+    progress = load_extract_progress(config)
+    resuming = bool(progress["embed"] or progress["curated"])
+
+    # Idempotency + resume guard (§ delete_ref_doc blocker): TextNode ids are random per
+    # run, so inserting into an already-populated namespace without --reset DUPLICATES
+    # nodes (Neo4j MERGE can't dedup them cross-run), and delete_ref_doc can't purge the
+    # directly-upserted graph nodes afterward. Refuse UNLESS either --reset ran (namespace
+    # already empty) or a matching progress file marks this as a resume of a partial run.
+    if not reset:
+        existing = count_book_nodes(stores.graph_store)
+        if existing and not resuming:
+            raise SystemExit(
+                f"Refusing to insert: {existing} node(s) already exist in the book namespace "
+                f"and no matching in-progress checkpoint was found. Re-ingesting without --reset "
+                f"would duplicate them (random node ids → no cross-run MERGE). Re-run with --reset "
+                f"to purge first."
+            )
+        if existing and resuming:
+            logger.warning(
+                f"Resuming a partial insertion (no --reset): "
+                f"{len(progress['embed'])} embed + {len(progress['curated'])} curated chunk(s) "
+                f"already committed; continuing with the unfinished tail."
+            )
+
+    # Stage 5: hybrid split by curated-slice membership. Curated books get full LLM
+    # entity extraction; everything else is embeddings-only but still vector-searchable.
+    # Split by CHUNK (not pre-built nodes) so the resumable inserter can rebuild each
+    # batch's nodes and key progress on a stable content hash.
+    curated_chunks: list[Chunk] = []
+    embed_chunks: list[Chunk] = []
     curated_books: set[str] = set()
     embed_books: set[str] = set()
     for c in chunks:
         stem = Path(c.source_path).stem
-        if is_curated(c.source_path):
-            curated_nodes.extend(chunk_to_nodes(c))
+        # --extract-all sends every book through LLM extraction (whole-corpus graph),
+        # bypassing the curated-slice gate. Only viable with the schema extractor —
+        # free-form extraction over the full corpus is a relation-type hairball.
+        if extract_all or is_curated(c.source_path):
+            curated_chunks.append(c)
             curated_books.add(stem)
         else:
-            embed_nodes.extend(chunk_to_nodes(c))
+            embed_chunks.append(c)
             embed_books.add(stem)
 
     logger.info(
-        f"Hybrid split: {len(curated_nodes)} node(s) from {len(curated_books)} curated book(s) "
-        f"→ LLM extraction; {len(embed_nodes)} node(s) from {len(embed_books)} book(s) → embeddings-only"
+        f"Hybrid split{' (--extract-all)' if extract_all else ''}: "
+        f"{len(curated_chunks)} curated chunk(s) from {len(curated_books)} book(s) "
+        f"→ LLM extraction; {len(embed_chunks)} chunk(s) from {len(embed_books)} book(s) → embeddings-only"
     )
 
-    # Embed-only first (fast, no LLM), then the curated slice (slow LLM extraction).
-    if embed_nodes:
-        with stage("embed_only_insertion", n_nodes=len(embed_nodes)):
-            logger.info(f"Inserting {len(embed_nodes)} embeddings-only node(s)...")
-            stores.embed_index.insert_nodes(embed_nodes)
-    if curated_nodes:
-        with stage("curated_extraction_insertion", n_nodes=len(curated_nodes)):
-            logger.info(f"Extracting + inserting {len(curated_nodes)} curated-slice node(s) via LLM...")
-            stores.extract_index.insert_nodes(curated_nodes)
+    # Silent-no-op guard: if NOTHING matched the curated slice, the graph gets
+    # embeddings only and ZERO entities/relations — a run that "succeeds" while
+    # writing no graph. That exact mismatch (library filenames vs classify.BOOK_LABELS)
+    # cost a full overnight run once. Warn loudly rather than fail, since an
+    # embeddings-only corpus is a legitimate run; escalate to a hard stop with --require-curated.
+    if not curated_chunks:
+        msg = (
+            "No books matched the curated slice (classify.BOOK_LABELS) — the graph will "
+            "have embeddings ONLY, 0 entities and 0 relations. If you expected entity "
+            "extraction, check that library filenames' stems exactly match a BOOK_LABELS "
+            "title (matching is exact: 'clean_code' != 'Clean Code'). "
+            f"Books seen: {sorted(embed_books)}"
+        )
+        if require_curated:
+            raise SystemExit(f"--require-curated: {msg}")
+        logger.warning(msg)
 
+    # Resumable, checkpointed insertion: embed-only first (fast, no LLM), then the curated
+    # slice (slow per-chunk LLM extraction). Each commits in batches and records progress,
+    # so a crash resumes from the last committed batch instead of restarting.
+    if embed_chunks:
+        with stage("embed_only_insertion", n_chunks=len(embed_chunks)):
+            n = insert_chunks_batched(
+                stores.embed_index, embed_chunks, progress, "embed", config,
+                label="Embeddings-only insert",
+            )
+            logger.info(f"Embeddings-only insertion complete ({n} node(s) inserted this run).")
+    if curated_chunks:
+        with stage("curated_extraction_insertion", n_chunks=len(curated_chunks)):
+            n = insert_chunks_batched(
+                stores.extract_index, curated_chunks, progress, "curated", config,
+                label="Curated LLM extraction", reset_llm=stores.extract_llm,
+            )
+            logger.info(f"Curated extraction complete ({n} node(s) inserted this run).")
+
+    # Clean completion → drop the progress file so the next run doesn't try to resume.
+    clear_extract_progress(config)
     logger.info("Ingestion pipeline complete.")
     if profiler:
         profiler.report()
@@ -793,19 +1549,63 @@ def main() -> None:
         help="Skip discovery/extraction/dedup and reuse the last saved chunks_checkpoint.json",
     )
     parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="Parse + dedup + write chunks_checkpoint.json, then stop before embedding/insertion "
+             "(no Neo4j needed). Resume the insert half later with --from-checkpoint.",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Enable per-stage timing via pipeline_profiler (writes to working_dir/profile_results)",
     )
+    parser.add_argument(
+        "--require-curated",
+        action="store_true",
+        help="Abort (instead of warn) if no library book matches the curated slice, so a "
+             "run that was meant to extract entities can't silently finish embeddings-only.",
+    )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="Skip the Ollama-model / non-empty-library preflight checks.",
+    )
+    parser.add_argument(
+        "--extract-all",
+        action="store_true",
+        help="Send EVERY book through LLM entity extraction (whole-corpus graph), "
+             "bypassing the curated-slice gate. Intended for the schema extractor.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
-    run_pipeline(
-        config,
-        reset=args.reset,
-        from_checkpoint=args.from_checkpoint,
-        profile=args.profile,
-    )
+    try:
+        run_pipeline(
+            config,
+            reset=args.reset,
+            from_checkpoint=args.from_checkpoint,
+            profile=args.profile,
+            extract_only=args.extract_only,
+            require_curated=args.require_curated,
+            skip_preflight=args.skip_preflight,
+            extract_all=args.extract_all,
+        )
+    except SystemExit:
+        raise  # clean, intentional exits (preflight/guards) — already logged their reason
+    except KeyboardInterrupt:
+        # A deliberate Ctrl+C is not a crash — log it gently (no scary traceback) and
+        # remind that the batch checkpoint means the run is resumable.
+        logger.warning(
+            "Interrupted by user (Ctrl+C). Committed batches are saved; "
+            "resume the unfinished tail with --from-checkpoint (no --reset)."
+        )
+        raise
+    except BaseException:
+        # Persist the fatal traceback to the file log too — an uncaught exception
+        # otherwise goes only to stderr, so an overnight crash left no on-disk cause
+        # (exactly what happened diagnosing the Event-loop-closed batch crash).
+        logger.exception("Ingestion pipeline crashed with an unhandled exception")
+        raise
 
 
 if __name__ == "__main__":

@@ -1,8 +1,11 @@
 # GraphRAG Assistant — ingestion pipeline config
 # Mounted into the ingest container at /app/config.yaml
-# All values here can be overridden by environment variables in .env
+#
+# Precedence (highest wins):  environment / .env  >  this file  >  built-in defaults.
+# A value set in BOTH .env and here, with different values, logs a "Config conflict"
+# warning at startup (env wins). Secrets (e.g. NEO4J_PASSWORD) belong in .env, not here.
 
-library_path: "D:\\IngestTest"
+library_path: "E:\\Learning Project Books\\General"
 working_dir:  ./lightrag_data
 
 embedding_model: all-MiniLM-L6-v2
